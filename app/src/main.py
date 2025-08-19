@@ -30,7 +30,12 @@ async def on_ready():
 
 @bot.tree.command(name="ping", description="Ping-Pong!")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Pong!")
+    await interaction.response.send_message("PongPong!")
+    
+@bot.tree.command(name="echo", description="そのまま返す")
+@discord.app_commands.describe(text="返してほしいテキスト")
+async def echo(interaction: discord.Interaction, text: str):
+    await interaction.response.send_message(text, ephemeral=True)
 
 @bot.event
 async def on_message(message: discord.Message):
