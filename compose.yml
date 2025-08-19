@@ -1,0 +1,25 @@
+services:
+  discord-bot:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    working_dir: /app
+    volumes:
+      - ./app/src:/app/src
+      - ./app/.env:/app/.env:ro
+    command:
+      - watchfiles
+      - --target-type=command
+      - --verbosity=info
+      - "python -u src/main.py"
+      - /app/src
+      - /app/.env   
+    env_file:
+      - ./app/.env
+    restart: unless-stopped
+    init: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
