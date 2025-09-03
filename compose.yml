@@ -7,13 +7,14 @@ services:
     volumes:
       - ./app/src:/app/src
       - ./app/.env:/app/.env:ro
+      - ./app/keys:/app/keys:ro
     command:
       - watchfiles
       - --target-type=command
       - --verbosity=info
       - "python -u src/main.py"
       - /app/src
-      - /app/.env   
+      - /app/.env
     env_file:
       - ./app/.env
     restart: unless-stopped
