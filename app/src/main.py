@@ -1,6 +1,7 @@
 import os
 import logging
-import traceback
+import asyncio, random
+from typing import Iterable, Tuple
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -9,6 +10,9 @@ import gspread_manager
 import sekai_api
 import shift_manager
 import ptlogger
+import storage
+from timeutils import ensure_aware_jst, JST
+from scheduler import EventScheduler, MultiMinuteRegistry
 
 load_dotenv(override=False)
 TOKEN = os.environ["DISCORD_TOKEN"]
@@ -22,17 +26,133 @@ if os.environ.get("ENABLE_MESSAGE_CONTENT", "0") == "1":
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+registry = MultiMinuteRegistry()
+
+@registry.every_hour_at_config("ChangeNotice")
+async def shift_change(ctx: dict) -> str:
+    cfg = ctx["config"]
+    channel = ctx.get("channel")
+    if channel is None:
+        return "ChangeNotice(no-channel)"
+    def runner_count(val) -> int:
+        if isinstance(val, list):
+            return len(val)
+        return 1 if val else 0
+
+    max_cols = max(1, 5 - runner_count(cfg.get("Runners")))
+    rows = shift_manager.extract_nearest_shift(
+        cfg.get("SpreadsheetID"),
+        max_shifters_per_block=max_cols,
+    )
+
+    lines = []
+    for i, item in enumerate(rows, 1):
+        dt = item.get("datetime")
+        try:
+            dt = dt.astimezone(JST)
+        except Exception:
+            pass
+        ts = dt.strftime("%m/%d %H:%M") if dt else "??:??"
+        names = ", ".join(item.get("shifters", [])) or "（割当なし）"
+        lines.append(f"{i}. {ts} — {names}")
+
+    msg = f"**ChangeNotice** — {cfg.get('EventName')}\n" + "\n".join(lines)
+    await channel.send(msg)
+    return "ChangeNotice"
+
+@registry.every_hour_at_config("NextServer")
+async def check_next_server(ctx: dict) -> str:
+    cfg = ctx["config"]
+    channel = ctx.get("channel")
+    if channel is None:
+        return "NextServer(no-channel)"
+    def runner_count(val) -> int:
+        if isinstance(val, list):
+            return len(val)
+        return 1 if val else 0
+
+    max_cols = max(1, 5 - runner_count(cfg.get("Runners")))
+    rows = shift_manager.extract_nearest_shift(
+        cfg.get("SpreadsheetID"),
+        max_shifters_per_block=max_cols,
+    )
+
+    lines = []
+    for i, item in enumerate(rows, 1):
+        dt = item.get("datetime")
+        try:
+            dt = dt.astimezone(JST)
+        except Exception:
+            pass
+        ts = dt.strftime("%m/%d %H:%M") if dt else "??:??"
+        names = ", ".join(item.get("shifters", [])) or "（割当なし）"
+        lines.append(f"{i}. {ts} — {names}")
+
+    msg = f"**NextServer** — {cfg.get('EventName')}\n" + "\n".join(lines)
+    await channel.send(msg)
+    return "NextServer"
+
+def _exp_backoff(attempt: int, base: float = 2.0, cap: float = 15.0, jitter: float = 0.25) -> float:
+    d = min(cap, base * (2 ** (attempt - 1)))
+    return d * (1 + (random.random() * 2 - 1) * jitter)
+
+async def retry_async(call, *, attempts: int = 3, catch: Tuple[type, ...] = (Exception,)) -> any:
+    last = None
+    for n in range(1, attempts + 1):
+        try:
+            return await call()
+        except catch as e:
+            last = e
+            if n == attempts:
+                break
+            await asyncio.sleep(_exp_backoff(n))
+    raise last
+from requests.exceptions import Timeout, ReadTimeout, ConnectionError as ReqConnError, RequestException
+
+async def ranking_logger(ctx: dict) -> str:
+    from requests.exceptions import ReadTimeout, Timeout, ConnectionError as ReqConnError, RequestException
+    cfg = ctx["config"]
+    async def _run_once():
+        if cfg.get("isWorldBloom"):
+            times = sekai_api.get_chapter_time(cfg["EventID"], cfg["CharaID"])
+        else:
+            times = sekai_api.get_event_time(cfg["EventID"])
+
+        if not times:
+            raise RuntimeError("empty times from API")
+
+        last_time = times[-1]
+
+        if cfg.get("isWorldBloom"):
+            raw = sekai_api.get_chapter_rankings(cfg["EventID"], cfg["CharaID"], last_time)
+        else:
+            raw = sekai_api.get_event_rankings(cfg["EventID"], last_time)
+
+        rankings = sekai_api.extract_scores(raw, cfg.get("Trackings"))
+        ptlogger.write_values(cfg["SpreadsheetID"], last_time, rankings)
+        return "api checked"
+
+    return await retry_async(
+        _run_once,
+        attempts=3,
+        catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
+    )
+
+for m in range(0, 60, 30):
+    registry.every_hour_at(m+1)(ranking_logger)
+
+scheduler = EventScheduler(bot, registry)
+
 @bot.event
 async def on_ready():
-    logger.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    if GUILD_ID:
-        guild = discord.Object(id=int(GUILD_ID))
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        logger.info(f"Synced {len(synced)} commands to guild {GUILD_ID}")
-    else:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} global commands")
+    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    saved = storage.load_all_configs()
+    for guild_id, cfg in saved.items():
+        try:
+            scheduler_running = scheduler.is_running(guild_id)
+            await scheduler.start_or_restart(guild_id, cfg)
+        except Exception as e:
+            print(f"[WARN] restore failed for guild {guild_id}: {e}")
 
 @bot.tree.command(name="ping", description="Ping-Pong!")
 async def ping(interaction: discord.Interaction):
@@ -42,34 +162,96 @@ async def ping(interaction: discord.Interaction):
 @app_commands.describe(text="返してほしいテキスト")
 async def echo(interaction: discord.Interaction, text: str):
     await interaction.response.send_message(text, ephemeral=True)
-
+    
 @bot.tree.command(name="setup", description="スプレッドシートのセットアップ")
 @app_commands.describe(text="スプレッドシートID")
 async def setup(interaction: discord.Interaction, text: str):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     config = gspread_manager.read_config_values(text)
-    if (config.get("ChapterNo") > 0):
-        event_id, _, _ = sekai_api.filter_event_info(sekai_api.get_event_info_by_name(config.get("EventName")))
-        config["CharaID"], start, end = sekai_api.filter_chapter_info(sekai_api.get_chapter_info(event_id, config.get("ChapterNo")))
-        config["isWorldBloom"] = True
+    event_name = (config.get("EventName") or "").strip()
+    chapter_no = int(config.get("ChapterNo") or 0)
+
+    if event_name:
+        if chapter_no > 0:
+            event_id, _, _ = sekai_api.filter_event_info(sekai_api.get_event_info_by_name(event_name))
+            config["CharaID"], start, end = sekai_api.filter_chapter_info(
+                sekai_api.get_chapter_info(event_id, chapter_no)
+            )
+            config["isWorldBloom"] = True
+        else:
+            event_id, start, end = sekai_api.filter_event_info(
+                sekai_api.get_event_info_by_name(event_name)
+            )
+            config["isWorldBloom"] = False
     else:
-        event_id, start, end = sekai_api.filter_event_info(sekai_api.get_event_info_by_name(config.get("EventName")))
-        config["isWorldBloom"] = False
-    config["EventStart"] = start
-    config["EventEnd"] = end
+        try:
+            event_id = int(str(config.get("EventID")).strip())
+        except (TypeError, ValueError):
+            await interaction.followup.send(
+                "設定エラー: EventName も EventID も正しく取得できませんでした。", ephemeral=True
+            )
+            return
+
+        try:
+            start = ensure_aware_jst(config.get("EventStart"))
+            end   = ensure_aware_jst(config.get("EventEnd"))
+        except Exception as e:
+            await interaction.followup.send(
+                f"設定エラー: EventStart/EventEnd の形式が不正です: {e}", ephemeral=True
+            )
+            return
+
+        if chapter_no > 0:
+            config["CharaID"], start, end = sekai_api.filter_chapter_info(
+                sekai_api.get_chapter_info(event_id, chapter_no)
+            )
+            config["isWorldBloom"] = True
+        else:
+            config["isWorldBloom"] = False
+
+        try:
+            ev_info = getattr(sekai_api, "get_event_info_by_id", None)
+            if callable(ev_info):
+                info = ev_info(event_id)
+                config["EventName"] = (info.get("name") or info.get("eventName") or "").strip() or None
+        except Exception:
+            pass
+        
+    config["EventID"] = event_id
+    config["EventStart"] = ensure_aware_jst(start).isoformat()
+    config["EventEnd"]   = ensure_aware_jst(end).isoformat()
+    config["ChannelID"] = int(interaction.channel_id)
+    config["SpreadsheetID"] = text
+
+    guild_id = interaction.guild_id or 0
+    storage.save_guild_config(guild_id, config)
+    await scheduler.start_or_restart(guild_id, config)
     runners = config.get("Runners")
-    if isinstance(runners, list):
-        runners_str = ", ".join(runners)
-    else:
-        runners_str = str(runners) if runners is not None else "未設定"
+    # runners_count = shift_manager.count_runners(runners)
+    # shift_manager.format_shift_table(text, start, end, 5 - runners_count)
+    ptlogger.format_pt_table(text, start, end, config.get("Trackings"))
+    runners_str = ", ".join(runners) if isinstance(runners, list) else (str(runners) if runners is not None else "未設定")
+    is_wb = config.get("isWorldBloom")
+    event_name_for_msg = config.get("EventName") or f"(ID: {event_id})"
+    change_min = int(config.get("ChangeNotice") or 0)
     message = (
-        "設定を読み込みました。\n"
-        f"- イベント名は {config.get('EventName')}\n"
-        f"- これは {'イベントの１チャプター' if config.get('isWorldBloom') else '通常イベント'}\n"
-        f"- ランナーは {runners_str}\n"
-        f"- イベントの開始日は {config.get('EventStart')}\n"
-        f"- 終了日は {config.get('EventEnd')}"
+        "設定を保存し、定期実行を登録しました。\n"
+        f"- イベント名: {event_name_for_msg}\n"
+        f"- 種別: {'イベントの１チャプター' if is_wb else '通常イベント'}\n"
+        f"- ランナー: {runners_str}\n"
+        f"- 開始: {config['EventStart']}\n"
+        f"- 終了: {config['EventEnd']}\n"
+        f"- 実行時刻: 毎時 {change_min:02d} 分\n"
+        f"- 投稿チャンネル: <#{config['ChannelID']}>"
     )
-    await interaction.response.send_message(message, ephemeral=True)
+    await interaction.followup.send(message, ephemeral=True)
+
+@bot.tree.command(name="clear_setup", description="保存済み設定を削除します（実行も停止）")
+async def clear_setup(interaction: discord.Interaction):
+    guild_id = interaction.guild_id or 0
+    scheduler.stop(guild_id)
+    storage.delete_guild_config(guild_id)
+    await interaction.response.send_message("設定を削除しました。", ephemeral=True)
 
 @bot.tree.error
 async def on_app_command_error(

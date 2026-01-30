@@ -35,12 +35,34 @@ def normalize_table(data):
         r += [""] * (ncols - len(r))
     return data
 
-def create_sheet(sh, sheet_title, total_rows, total_cols):
+def create_sheet(sh, sheet_title, total_rows, total_cols, *, resize_if_smaller=False):
+    try:
+        ws = sh.worksheet(sheet_title)
+        if resize_if_smaller and (ws.row_count < total_rows or ws.col_count < total_cols):
+            ws.resize(
+                rows=max(ws.row_count, int(total_rows)),
+                cols=max(ws.col_count, int(total_cols)),
+            )
+        return ws
+    except gspread.exceptions.WorksheetNotFound:
+        pass
     try:
         ws = sh.add_worksheet(title=sheet_title, rows=total_rows, cols=total_cols)
-    except gspread.exceptions.APIError:
-        raise ValueError(f"SpreadSheet への権限が足りないか、既にシート名 {sheet_title} が存在します。")
-    return ws
+        return ws
+    except gspread.exceptions.APIError as e:
+        try:
+            ws = sh.worksheet(sheet_title)
+            if resize_if_smaller and (ws.row_count < total_rows or ws.col_count < total_cols):
+                ws.resize(
+                    rows=max(ws.row_count, int(total_rows)),
+                    cols=max(ws.col_count, int(total_cols)),
+                )
+            return ws
+        except gspread.exceptions.WorksheetNotFound:
+            raise ValueError(
+                f"シート '{sheet_title}' の作成に失敗しました。"
+                "SpreadSheet への権限が足りない可能性があります。"
+            ) from e
 
 _ISO8601_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+\-]\d{2}:\d{2})?)?$"
@@ -105,11 +127,3 @@ def read_config_values(spreadsheet_id: str, sheet_name: str = "Config") -> Dict[
         values = row[1:] if len(row) > 1 else []
         config[key] = _coerce_values(values)
     return config
-
-def count_runners(value):
-    if isinstance(value, list):
-        return len(value)
-    elif isinstance(value, str):
-        return 1
-    else:
-        return 0

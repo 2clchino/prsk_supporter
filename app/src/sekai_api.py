@@ -45,7 +45,7 @@ def get_event_time(event_id):
         "region": REGION
     }
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, timeout=100)
         print("Status:", resp.status_code)
         print("URL:", resp.url)
         resp.raise_for_status()
@@ -93,7 +93,7 @@ def get_chapter_time(event_id, chara_id):
     url = f"{BASE_URL}/event/{event_id}/chapter_rankings/time"
     params = {"charaId": chara_id, "region": REGION}
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, timeout=100)
         print("Status:", resp.status_code)
         print("URL:", resp.url)
         resp.raise_for_status()
@@ -122,18 +122,26 @@ def get_chapter_rankings(event_id, chara_id, ts):
 def extract_scores(rankings: List[Dict[str, Any]],
                    targets: List[Union[int, str]]) -> Dict[Union[int, str], Any]:
     result: Dict[Union[int, str], Any] = {}
-
+    def is_userid_like(x: Any) -> bool:
+        return isinstance(x, int) and len(str(abs(x))) >= 15
     for entry in rankings:
         rank_val = entry.get("rank")
         user_name = entry.get("userName")
+        user_id   = entry.get("userId")
+        user_id_str = str(user_id) if user_id is not None else None
         score_val = entry.get("score")
-
         for t in targets:
-            if (isinstance(t, int) and rank_val == t) or (isinstance(t, str) and user_name == t):
-                result[t] = score_val
+            if is_userid_like(t):
+                if user_id_str is not None and user_id_str == str(t):
+                    result[t] = score_val
+            elif isinstance(t, int):
+                if rank_val == t:
+                    result[t] = score_val
+            elif isinstance(t, str):
+                if user_name == t:
+                    result[t] = score_val
 
     return result
-
 def pick_hourly(times: List[str]) -> List[str]:
     dt_list = [datetime.fromisoformat(t.replace("Z", "+00:00")) for t in times]
     dt_list.sort()

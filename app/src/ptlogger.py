@@ -9,7 +9,7 @@ def format_pt_table(spreadsheet_id: str,
                     start: datetime,
                     end: datetime,
                     trackings: List[int],
-                    sheet_title: str = "PtLogs") -> None:
+                    sheet_title: str = "PtLogs5min") -> None:
     if start > end:
         raise ValueError("start must be <= end")
     sh = gspread_manager.load_sheet(spreadsheet_id)
@@ -17,7 +17,7 @@ def format_pt_table(spreadsheet_id: str,
     t = start
     while t <= end:
         times.append(t)
-        t += timedelta(hours=1)
+        t += timedelta(minutes=30)
 
     n_rows = 1 + len(times)
     n_cols = 2 + max(len(trackings), 0)
@@ -34,10 +34,11 @@ def format_pt_table(spreadsheet_id: str,
     for dt in times:
         d = dt.date()
         day_cell = f"{dt.month}/{dt.day}" if d != prev_date else ""
-        hour_cell = dt.strftime("%H:%M")
-        day_hour_rows.append([day_cell, hour_cell])
+        time_cell = dt.strftime("%H:%M")
+        day_hour_rows.append([day_cell, time_cell])
         prev_date = d
-    ws.update(values=day_hour_rows, range_name=f"A2:B{1+len(times)}")
+
+    ws.update(values=day_hour_rows, range_name=f"A2:B{1 + len(times)}")
 
 def _col_letter(n: int) -> str:
     if n < 1:
@@ -53,7 +54,7 @@ def write_values(spreadsheet_id: str,
                  iso_timestamp: str,
                  values_by_header: Dict[Union[int, str], Any],
                  tz_name: str = "Asia/Tokyo",
-                 sheet_title: str = "PtLogs") -> None:
+                 sheet_title: str = "PtLogs5min") -> None:
     ts = iso_timestamp.strip()
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
@@ -122,14 +123,25 @@ def write_values(spreadsheet_id: str,
         raise ValueError(f"対象日 {target_day_str} の行が見つかりませんでした。")
 
     data_requests = []
-    for k, v in values_by_header.items():
-        key_str = str(k)
-        col = header_map.get(key_str)
-        if col is None:
-            continue
-        a1 = f"{_col_letter(col)}{best_row}"
-        data_requests.append({"range": a1, "values": [[v]]})
+    ranges = []
+    idx_to_key: dict[int, str] = {}
+    for k in values_by_header.keys():
+        col = header_map.get(str(k))
+        if col:
+            a1 = f"{_col_letter(col)}{best_row}"
+            ranges.append(a1)
+            idx_to_key[len(ranges) - 1] = str(k)
+
+    if not ranges:
+        return
+
+    current_vals = ws.batch_get(ranges)
+    for i, a1 in enumerate(ranges):
+        cur = current_vals[i][0] if (i < len(current_vals) and current_vals[i]) else ""
+        if not str(cur).strip():
+            key_str = idx_to_key[i]
+            data_requests.append({"range": a1, "values": [[values_by_header[key_str if key_str in values_by_header else int(key_str)]]]} )
 
     if not data_requests:
-        return
+        raise ValueError(f"{target_day_str} の最適行 {best_row} は全対象カラムが既に埋まっています。")
     ws.batch_update(data_requests)

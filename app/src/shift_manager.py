@@ -94,7 +94,13 @@ def collect_candidates(data, date_cols, tz, max_shifters_per_block):
             candidates.append((diff, dt, shifters, bi, r, date_col))
     return candidates
 
-def choose_best_candidate(candidates, tz):
+def choose_row_and_next(
+    candidates,
+    tz,
+    data,
+    date_cols,
+    max_shifters_per_block,
+):
     if not candidates:
         raise ValueError("no valid time rows found")
 
@@ -102,19 +108,48 @@ def choose_best_candidate(candidates, tz):
     past_candidates = [c for c in candidates if c[1] <= now]
     if not past_candidates:
         raise ValueError("no past time rows found")
-    past_candidates.sort(key=lambda x: (abs((now - x[1]).total_seconds()), x[1]))
-    _, best_dt, best_shifters, bi, r, date_col = past_candidates[0]
 
-    return {
-        "datetime": best_dt,
-        "shifters": best_shifters,
-    }
+    past_candidates.sort(key=lambda x: (abs((now - x[1]).total_seconds()), x[1]))
+    _, _, _, bi, r, date_col = past_candidates[0]
+
+    return _build_two_rows(data, date_cols, bi, r, date_col, tz, max_shifters_per_block)
+
+
+def _build_two_rows(data, date_cols, bi, start_r, date_col, tz, max_shifters_per_block):
+    out = []
+    ncols = len(data[0])
+    base_date = parse_date(data[0][date_col].strip(), tz)
+    if not base_date:
+        raise ValueError("invalid base date in header")
+
+    next_date_col = date_cols[bi + 1] if bi + 1 < len(date_cols) else ncols
+    shift_start = date_col + 1
+    shift_end_exclusive = min(date_col + 1 + max_shifters_per_block, next_date_col)
+
+    for r in (start_r, start_r + 1):
+        if not (1 <= r < len(data)):
+            continue
+        tstr = data[r][date_col].strip()
+        if not TIME_RE.match(tstr):
+            continue
+        hh, mm = map(int, tstr.split(":"))
+        dt = datetime.combine(base_date, time(hh, mm, tzinfo=tz))
+        shifters = [
+            data[r][c].strip()
+            for c in range(shift_start, shift_end_exclusive)
+            if data[r][c].strip()
+        ]
+        out.append({"datetime": dt, "shifters": shifters})
+
+    if not out:
+        raise ValueError("no valid time rows found at target rows")
+    return out
     
 def extract_nearest_shift(
     spreadsheet_id: str,
+    max_shifters_per_block: int = 4,
     sheet_title: str = "Shift",
     tz_str: str = "Asia/Tokyo",
-    max_shifters_per_block: int = 4,
 ):
     tz = ZoneInfo(tz_str)
     data = gspread_manager.load_table(spreadsheet_id, sheet_title)
@@ -126,4 +161,17 @@ def extract_nearest_shift(
         raise ValueError("no date headers found")
 
     candidates = collect_candidates(data, date_cols, tz, max_shifters_per_block)
-    return choose_best_candidate(candidates, tz)
+    return choose_row_and_next(
+        candidates, tz,
+        data=data,
+        date_cols=date_cols,
+        max_shifters_per_block=max_shifters_per_block,
+    )
+
+def count_runners(value):
+    if isinstance(value, list):
+        return len(value)
+    elif isinstance(value, str):
+        return 1
+    else:
+        return 0
