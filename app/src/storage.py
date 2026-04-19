@@ -47,11 +47,6 @@ def _write_all(data: Dict[str, Any]) -> None:
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(_STORE_PATH)
 
-def save_guild_config(guild_id: int, cfg: Dict[str, Any]) -> None:
-    data = _read_all()
-    data[str(guild_id)] = cfg
-    _write_all(data)
-
 def _get_guilds_view(data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(data.get("guilds"), dict):
         return data["guilds"]

@@ -36,6 +36,15 @@ def get_event_info_by_name(event_name):
             return evt
     raise ValueError(f"イベント名【{event_name}】が見つかりませんでした。")
 
+def get_event_info_by_id(event_id: int):
+    events = fetch_event_list()
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        if evt.get("id") == event_id:
+            return evt
+    raise ValueError(f"EventID [{event_id}] が見つかりませんでした。")
+
 def filter_event_info(evt):
     return evt.get("id"), datetime.fromtimestamp(evt.get("startAt") / 1000, tz=JST), datetime.fromtimestamp(evt.get("aggregateAt") / 1000, tz=JST)
 

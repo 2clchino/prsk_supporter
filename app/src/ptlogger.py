@@ -9,7 +9,8 @@ def format_pt_table(spreadsheet_id: str,
                     start: datetime,
                     end: datetime,
                     trackings: List[int],
-                    sheet_title: str = "PtLogs5min") -> None:
+                    interval_minutes: int = 60,
+                    sheet_title: str = "PtLogs") -> None:
     if start > end:
         raise ValueError("start must be <= end")
     sh = gspread_manager.load_sheet(spreadsheet_id)
@@ -17,7 +18,7 @@ def format_pt_table(spreadsheet_id: str,
     t = start
     while t <= end:
         times.append(t)
-        t += timedelta(minutes=30)
+        t += timedelta(minutes=interval_minutes)
 
     n_rows = 1 + len(times)
     n_cols = 2 + max(len(trackings), 0)
@@ -54,7 +55,7 @@ def write_values(spreadsheet_id: str,
                  iso_timestamp: str,
                  values_by_header: Dict[Union[int, str], Any],
                  tz_name: str = "Asia/Tokyo",
-                 sheet_title: str = "PtLogs5min") -> None:
+                 sheet_title: str = "PtLogs") -> None:
     ts = iso_timestamp.strip()
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"

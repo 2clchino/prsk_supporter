@@ -109,6 +109,7 @@ async def retry_async(call, *, attempts: int = 3, catch: Tuple[type, ...] = (Exc
     raise last
 from requests.exceptions import Timeout, ReadTimeout, ConnectionError as ReqConnError, RequestException
 
+@registry.every_hour_at_config("LogMinutes")
 async def ranking_logger(ctx: dict) -> str:
     from requests.exceptions import ReadTimeout, Timeout, ConnectionError as ReqConnError, RequestException
     cfg = ctx["config"]
@@ -137,9 +138,6 @@ async def ranking_logger(ctx: dict) -> str:
         attempts=3,
         catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
     )
-
-for m in range(0, 60, 30):
-    registry.every_hour_at(m+1)(ranking_logger)
 
 scheduler = EventScheduler(bot, registry)
 
@@ -192,14 +190,29 @@ async def setup(interaction: discord.Interaction, text: str):
             )
             return
 
-        try:
-            start = ensure_aware_jst(config.get("EventStart"))
-            end   = ensure_aware_jst(config.get("EventEnd"))
-        except Exception as e:
-            await interaction.followup.send(
-                f"設定エラー: EventStart/EventEnd の形式が不正です: {e}", ephemeral=True
-            )
-            return
+        event_start_raw = config.get("EventStart")
+        event_end_raw = config.get("EventEnd")
+
+        if not event_start_raw or not event_end_raw:
+            try:
+                ev_info = sekai_api.get_event_info_by_id(event_id)
+                _, start, end = sekai_api.filter_event_info(ev_info)
+                if not config.get("EventName"):
+                    config["EventName"] = (ev_info.get("name") or "").strip() or None
+            except Exception as e:
+                await interaction.followup.send(
+                    f"設定エラー: EventStart/EventEnd が未設定で、EventID からの自動取得にも失敗しました: {e}", ephemeral=True
+                )
+                return
+        else:
+            try:
+                start = ensure_aware_jst(event_start_raw)
+                end   = ensure_aware_jst(event_end_raw)
+            except Exception as e:
+                await interaction.followup.send(
+                    f"設定エラー: EventStart/EventEnd の形式が不正です: {e}", ephemeral=True
+                )
+                return
 
         if chapter_no > 0:
             config["CharaID"], start, end = sekai_api.filter_chapter_info(
@@ -208,14 +221,6 @@ async def setup(interaction: discord.Interaction, text: str):
             config["isWorldBloom"] = True
         else:
             config["isWorldBloom"] = False
-
-        try:
-            ev_info = getattr(sekai_api, "get_event_info_by_id", None)
-            if callable(ev_info):
-                info = ev_info(event_id)
-                config["EventName"] = (info.get("name") or info.get("eventName") or "").strip() or None
-        except Exception:
-            pass
         
     config["EventID"] = event_id
     config["EventStart"] = ensure_aware_jst(start).isoformat()
@@ -223,17 +228,26 @@ async def setup(interaction: discord.Interaction, text: str):
     config["ChannelID"] = int(interaction.channel_id)
     config["SpreadsheetID"] = text
 
+    log_interval = config.get("LogInterval", 60)
+    try:
+        log_interval = int(log_interval)
+        if log_interval <= 0 or log_interval > 60:
+            log_interval = 60
+    except (TypeError, ValueError):
+        log_interval = 60
+    config["LogInterval"] = log_interval
+    config["LogMinutes"] = sorted(set((m + 1) % 60 for m in range(0, 60, log_interval)))
+
     guild_id = interaction.guild_id or 0
     storage.save_guild_config(guild_id, config)
     await scheduler.start_or_restart(guild_id, config)
     runners = config.get("Runners")
-    # runners_count = shift_manager.count_runners(runners)
-    # shift_manager.format_shift_table(text, start, end, 5 - runners_count)
-    ptlogger.format_pt_table(text, start, end, config.get("Trackings"))
+    ptlogger.format_pt_table(text, start, end, config.get("Trackings"), interval_minutes=log_interval)
     runners_str = ", ".join(runners) if isinstance(runners, list) else (str(runners) if runners is not None else "未設定")
     is_wb = config.get("isWorldBloom")
     event_name_for_msg = config.get("EventName") or f"(ID: {event_id})"
     change_min = int(config.get("ChangeNotice") or 0)
+    log_minutes_str = ", ".join(f"{m:02d}" for m in config["LogMinutes"])
     message = (
         "設定を保存し、定期実行を登録しました。\n"
         f"- イベント名: {event_name_for_msg}\n"
@@ -241,7 +255,8 @@ async def setup(interaction: discord.Interaction, text: str):
         f"- ランナー: {runners_str}\n"
         f"- 開始: {config['EventStart']}\n"
         f"- 終了: {config['EventEnd']}\n"
-        f"- 実行時刻: 毎時 {change_min:02d} 分\n"
+        f"- シフト通知: 毎時 {change_min:02d} 分\n"
+        f"- ログ記録: {log_interval}分間隔（毎時 {log_minutes_str} 分）\n"
         f"- 投稿チャンネル: <#{config['ChannelID']}>"
     )
     await interaction.followup.send(message, ephemeral=True)
@@ -260,7 +275,6 @@ async def on_app_command_error(
 ):
     original = getattr(error, "original", error)
     logger.exception("Command error: %r", error)
-
     if isinstance(original, ValueError):
         msg = f"エラー: {original}"
     elif isinstance(error, app_commands.CommandOnCooldown):
@@ -271,7 +285,6 @@ async def on_app_command_error(
         msg = "このコマンドを実行できません。"
     else:
         msg = "予期しないエラーが発生しました。"
-
     try:
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
@@ -279,7 +292,9 @@ async def on_app_command_error(
             await interaction.response.send_message(msg, ephemeral=True)
     except discord.InteractionResponded:
         await interaction.followup.send(msg, ephemeral=True)
-
+    except discord.errors.NotFound:
+        logger.warning("Interaction expired (10062): Could not send error message")
+        
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:

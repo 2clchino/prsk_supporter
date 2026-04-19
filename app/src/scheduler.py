@@ -15,6 +15,16 @@ Callback = Callable[[dict], Awaitable[Any]] | Callable[[dict], Any]
 def _cb_key(func) -> str:
     return getattr(func, "__qualname__", getattr(func, "__name__", repr(func)))
 
+def _compute_log_minutes(cfg: dict) -> list[int]:
+    interval = cfg.get("LogInterval", 60)
+    try:
+        interval = int(interval)
+        if interval <= 0 or interval > 60:
+            interval = 60
+    except (TypeError, ValueError):
+        interval = 60
+    return sorted(set((m + 1) % 60 for m in range(0, 60, interval)))
+
 def _coerce_minutes(val) -> list[int]:
     out: list[int] = []
     def add_one(x):
@@ -126,11 +136,7 @@ class EventScheduler:
 
         start = ensure_aware_jst(cfg["EventStart"])
         end   = ensure_aware_jst(cfg["EventEnd"])
-        def pick_minutes(cfg: dict) -> list[int]:
-            mins = set(range(1, 60, 30))
-            return sorted(mins)
-
-        minutes = pick_minutes(cfg)
+        log_minutes = _compute_log_minutes(cfg)
 
         while True:
             now = now_jst()
@@ -138,8 +144,7 @@ class EventScheduler:
                 await _safe_send(channel, f"⏹️ イベント期間が終了しました（End: {end}）。定期実行を停止します。")
                 break
 
-            minutes_set = set(range(1, 60, 30))
-            minutes = sorted(minutes_set)
+            minutes = log_minutes
 
             base = start if now < start else now
             candidates = [(m, first_tick_on_or_after(base, m)) for m in minutes]
