@@ -65,6 +65,34 @@ def get_event_time(event_id):
         print("Error:", e)
         return []
     
+def _get_leaderboard_sekai_run() -> list:
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto('https://sekai.run/', wait_until='domcontentloaded', timeout=30000)
+        page.wait_for_timeout(8000)
+        rankings = page.evaluate('''() => {
+            const results = [];
+            const rows = document.querySelectorAll('tr:has(th.rank)');
+            for (const tr of rows) {
+                const rank = parseInt(tr.querySelector('th.rank').innerText.trim());
+                const tds = tr.querySelectorAll('td');
+                const name = tds[1] ? tds[1].innerText.trim() : '';
+                const scoreRaw = tds[2] ? tds[2].innerText.trim() : '';
+                const score = parseInt(scoreRaw.replace(/,/g, ''));
+                if (!isNaN(rank) && name && !isNaN(score)) {
+                    results.push({rank, name, score});
+                }
+            }
+            return results;
+        }''')
+        browser.close()
+    return [
+        {"rank": e["rank"], "score": e["score"], "userName": e["name"], "userId": None}
+        for e in rankings
+    ]
+
 def get_event_rankings(event_id, ts):
     url = f"{BASE_URL}/event/{event_id}/rankings"
     params = {"timestamp": ts, "region": REGION}
@@ -78,8 +106,12 @@ def get_event_rankings(event_id, ts):
         return data.get("eventRankings")
     except Exception as e:
         print("Error:", e)
+    try:
+        return _get_leaderboard_sekai_run()
+    except Exception as e:
+        print("Fallback Error:", e)
         return []
-    
+
 def fetch_world_bloom():
     resp = requests.get(WORLD_BLOOM_JSON_URL)
     resp.raise_for_status()
@@ -126,8 +158,12 @@ def get_chapter_rankings(event_id, chara_id, ts):
         return data.get("eventRankings")
     except Exception as e:
         print("Error:", e)
+    try:
+        return _get_leaderboard_sekai_run()
+    except Exception as e:
+        print("Fallback Error:", e)
         return []
-    
+
 def extract_scores(rankings: List[Dict[str, Any]],
                    targets: List[Union[int, str]]) -> Dict[Union[int, str], Any]:
     result: Dict[Union[int, str], Any] = {}

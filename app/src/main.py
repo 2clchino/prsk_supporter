@@ -11,7 +11,7 @@ import sekai_api
 import shift_manager
 import ptlogger
 import storage
-from timeutils import ensure_aware_jst, JST
+from timeutils import ensure_aware_jst, now_jst, JST
 from scheduler import EventScheduler, MultiMinuteRegistry
 
 load_dotenv(override=False)
@@ -119,19 +119,23 @@ async def ranking_logger(ctx: dict) -> str:
         else:
             times = sekai_api.get_event_time(cfg["EventID"])
 
-        if not times:
-            raise RuntimeError("empty times from API")
-
-        last_time = times[-1]
-
-        if cfg.get("isWorldBloom"):
-            raw = sekai_api.get_chapter_rankings(cfg["EventID"], cfg["CharaID"], last_time)
+        if times:
+            last_time = times[-1]
+            if cfg.get("isWorldBloom"):
+                raw = sekai_api.get_chapter_rankings(cfg["EventID"], cfg["CharaID"], last_time)
+            else:
+                raw = sekai_api.get_event_rankings(cfg["EventID"], last_time)
+            used_fallback = False
         else:
-            raw = sekai_api.get_event_rankings(cfg["EventID"], last_time)
+            raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_run)
+            if not raw:
+                raise RuntimeError("API unavailable and fallback also failed")
+            last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
+            used_fallback = True
 
         rankings = sekai_api.extract_scores(raw, cfg.get("Trackings"))
         ptlogger.write_values(cfg["SpreadsheetID"], last_time, rankings)
-        return "api checked"
+        return "api checked (fallback)" if used_fallback else "api checked"
 
     return await retry_async(
         _run_once,

@@ -5,13 +5,17 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
     TZ=Asia/Tokyo
 
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && pip install -r requirements.txt \
+    && playwright install-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY src ./src
 RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
+
+RUN playwright install chromium

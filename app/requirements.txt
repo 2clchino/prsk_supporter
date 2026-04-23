@@ -6,3 +6,4 @@ matplotlib
 watchfiles
 gspread
 dotenv
+playwright
