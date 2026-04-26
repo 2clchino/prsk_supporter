@@ -65,28 +65,42 @@ def get_event_time(event_id):
         print("Error:", e)
         return []
     
-def _get_leaderboard_sekai_run() -> list:
+_CHARA_ID_TO_NAME = {
+    1: "Ichika", 2: "Saki", 3: "Honami", 4: "Shiho",
+    5: "Minori", 6: "Haruka", 7: "Airi", 8: "Shizuku",
+    9: "Kohane", 10: "An", 11: "Akito", 12: "Toya",
+    13: "Tsukasa", 14: "Emu", 15: "Nene", 16: "Rui",
+    17: "Kanade", 18: "Mafuyu", 19: "Ena", 20: "Mizuki",
+    21: "Miku", 22: "Rin", 23: "Len", 24: "Luka",
+    25: "MEIKO", 26: "KAITO",
+}
+
+def _get_leaderboard_sekai_run(chara_id: int = None) -> list:
+    card_title = _CHARA_ID_TO_NAME.get(chara_id) if chara_id else "Overall"
+    js = f"""() => {{
+        const title = {repr(card_title)};
+        const card = [...document.querySelectorAll('.card')].find(
+            c => c.querySelector('h3')?.innerText.trim() === title
+        );
+        if (!card) return [];
+        const results = [];
+        for (const tr of card.querySelectorAll('tr:has(th.rank)')) {{
+            const rank = parseInt(tr.querySelector('th.rank').innerText.trim());
+            const tds = tr.querySelectorAll('td');
+            const name = tds[1] ? tds[1].innerText.trim() : '';
+            const scoreRaw = tds[2] ? tds[2].innerText.trim() : '';
+            const score = parseInt(scoreRaw.replace(/,/g, ''));
+            if (!isNaN(rank) && name && !isNaN(score)) results.push({{rank, name, score}});
+        }}
+        return results;
+    }}"""
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto('https://sekai.run/', wait_until='domcontentloaded', timeout=30000)
         page.wait_for_timeout(8000)
-        rankings = page.evaluate('''() => {
-            const results = [];
-            const rows = document.querySelectorAll('tr:has(th.rank)');
-            for (const tr of rows) {
-                const rank = parseInt(tr.querySelector('th.rank').innerText.trim());
-                const tds = tr.querySelectorAll('td');
-                const name = tds[1] ? tds[1].innerText.trim() : '';
-                const scoreRaw = tds[2] ? tds[2].innerText.trim() : '';
-                const score = parseInt(scoreRaw.replace(/,/g, ''));
-                if (!isNaN(rank) && name && !isNaN(score)) {
-                    results.push({rank, name, score});
-                }
-            }
-            return results;
-        }''')
+        rankings = page.evaluate(js)
         browser.close()
     return [
         {"rank": e["rank"], "score": e["score"], "userName": e["name"], "userId": None}
@@ -107,7 +121,7 @@ def get_event_rankings(event_id, ts):
     except Exception as e:
         print("Error:", e)
     try:
-        return _get_leaderboard_sekai_run()
+        return _get_leaderboard_sekai_run(chara_id=None)
     except Exception as e:
         print("Fallback Error:", e)
         return []
@@ -159,7 +173,7 @@ def get_chapter_rankings(event_id, chara_id, ts):
     except Exception as e:
         print("Error:", e)
     try:
-        return _get_leaderboard_sekai_run()
+        return _get_leaderboard_sekai_run(chara_id=chara_id)
     except Exception as e:
         print("Fallback Error:", e)
         return []

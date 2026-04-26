@@ -127,7 +127,8 @@ async def ranking_logger(ctx: dict) -> str:
                 raw = sekai_api.get_event_rankings(cfg["EventID"], last_time)
             used_fallback = False
         else:
-            raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_run)
+            chara_id = cfg.get("CharaID") if cfg.get("isWorldBloom") else None
+            raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_run, chara_id)
             if not raw:
                 raise RuntimeError("API unavailable and fallback also failed")
             last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
