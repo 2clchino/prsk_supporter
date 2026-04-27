@@ -109,10 +109,61 @@ async def retry_async(call, *, attempts: int = 3, catch: Tuple[type, ...] = (Exc
     raise last
 from requests.exceptions import Timeout, ReadTimeout, ConnectionError as ReqConnError, RequestException
 
+class PointInputModal(discord.ui.Modal):
+    point = discord.ui.TextInput(
+        label="現在のポイント",
+        placeholder="例: 1234567",
+        max_length=20,
+    )
+
+    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str):
+        super().__init__(title=f"ポイント入力: {str(tracking_key)[:40]}")
+        self.tracking_key = tracking_key
+        self.spreadsheet_id = spreadsheet_id
+        self.timestamp = timestamp
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            score = int(str(self.point.value).replace(",", "").replace("_", ""))
+        except ValueError:
+            await interaction.response.send_message("数値を入力してください。", ephemeral=True)
+            return
+        try:
+            await asyncio.to_thread(
+                ptlogger.write_values,
+                self.spreadsheet_id,
+                self.timestamp,
+                {self.tracking_key: score},
+            )
+            await interaction.response.send_message(
+                f"✅ {self.tracking_key} のポイント {score:,} を記録しました。", ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(f"記録に失敗しました: {e}", ephemeral=True)
+
+class PointInputButton(discord.ui.Button):
+    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str):
+        super().__init__(label=str(tracking_key)[:80], style=discord.ButtonStyle.primary)
+        self.tracking_key = tracking_key
+        self.spreadsheet_id = spreadsheet_id
+        self.timestamp = timestamp
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            PointInputModal(self.tracking_key, self.spreadsheet_id, self.timestamp)
+        )
+
+class MissingUsersView(discord.ui.View):
+    def __init__(self, missing_keys: list, spreadsheet_id: str, timestamp: str):
+        super().__init__(timeout=600)
+        for key in missing_keys:
+            self.add_item(PointInputButton(key, spreadsheet_id, timestamp))
+
 @registry.every_hour_at_config("LogMinutes")
 async def ranking_logger(ctx: dict) -> str:
     from requests.exceptions import ReadTimeout, Timeout, ConnectionError as ReqConnError, RequestException
     cfg = ctx["config"]
+    channel = ctx.get("channel")
     async def _run_once():
         if cfg.get("isWorldBloom"):
             times = sekai_api.get_chapter_time(cfg["EventID"], cfg["CharaID"])
@@ -134,9 +185,46 @@ async def ranking_logger(ctx: dict) -> str:
             last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
             used_fallback = True
 
-        rankings = sekai_api.extract_scores(raw, cfg.get("Trackings"))
+        trackings = cfg.get("Trackings") or []
+        focus_raw = cfg.get("Focus") or []
+        focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
+
+        all_targets = trackings + [f for f in focus_targets if f not in trackings]
+        all_scores = sekai_api.extract_scores(raw, all_targets)
+
+        rankings = {k: v for k, v in all_scores.items() if k in trackings}
+        focus_scores = {k: v for k, v in all_scores.items() if k in focus_targets}
+
         ptlogger.write_values(cfg["SpreadsheetID"], last_time, rankings)
-        return "api checked (fallback)" if used_fallback else "api checked"
+
+        missing = [t for t in trackings if t not in rankings]
+        if missing and channel:
+            view = MissingUsersView(missing, cfg["SpreadsheetID"], last_time)
+            await channel.send(
+                "⚠️ 以下のユーザーのポイントが取得できませんでした。該当する方はボタンを押してポイントを入力してください。",
+                view=view,
+            )
+
+        def _is_player(t) -> bool:
+            if isinstance(t, str):
+                return True
+            return isinstance(t, int) and len(str(abs(t))) >= 15
+
+        lines = []
+        player_scores = {k: v for k, v in rankings.items() if _is_player(k)}
+        for k, v in player_scores.items():
+            lines.append(f"**{k}**: {v:,}")
+        for fk, fv in focus_scores.items():
+            diffs = []
+            for k, v in player_scores.items():
+                diff = v - fv
+                sign = "+" if diff >= 0 else ""
+                diffs.append(f"{k} {sign}{diff:,}")
+            diff_str = " / ".join(diffs) if diffs else "—"
+            lines.append(f"Focus rank{fk}: {fv:,}（{diff_str}）")
+
+        suffix = " (fallback)" if used_fallback else ""
+        return "\n".join(lines) + suffix if lines else f"api checked{suffix}"
 
     return await retry_async(
         _run_once,
