@@ -168,6 +168,39 @@ def extract_nearest_shift(
         max_shifters_per_block=max_shifters_per_block,
     )
 
+def is_auto_period(
+    spreadsheet_id: str,
+    dt: datetime,
+    sheet_title: str = "Shift",
+) -> bool:
+    tz = dt.tzinfo or ZoneInfo("Asia/Tokyo")
+    try:
+        data = gspread_manager.load_table(spreadsheet_id, sheet_title)
+    except Exception:
+        return False
+    if not data or len(data) < 2:
+        return False
+
+    date_cols = find_date_columns(data[0])
+    target_date = dt.date()
+
+    for i, date_col in enumerate(date_cols):
+        col_date = parse_date(data[0][date_col].strip(), tz)
+        if col_date != target_date:
+            continue
+        next_date_col = date_cols[i + 1] if i + 1 < len(date_cols) else len(data[0])
+        for r in range(1, len(data)):
+            tstr = data[r][date_col].strip() if date_col < len(data[r]) else ""
+            if not TIME_RE.match(tstr):
+                continue
+            if int(tstr.split(":")[0]) != dt.hour:
+                continue
+            for c in range(date_col + 1, next_date_col):
+                if c < len(data[r]) and data[r][c].strip().lower() == "auto":
+                    return True
+    return False
+
+
 def count_runners(value):
     if isinstance(value, list):
         return len(value)

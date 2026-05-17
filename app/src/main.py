@@ -109,6 +109,40 @@ async def retry_async(call, *, attempts: int = 3, catch: Tuple[type, ...] = (Exc
     raise last
 from requests.exceptions import Timeout, ReadTimeout, ConnectionError as ReqConnError, RequestException
 
+def _is_player(t) -> bool:
+    if isinstance(t, str):
+        return True
+    return isinstance(t, int) and len(str(abs(t))) >= 15
+
+async def _fetch_all_scores(cfg: dict) -> tuple[dict, str, bool]:
+    if cfg.get("isWorldBloom"):
+        times = sekai_api.get_chapter_time(cfg["EventID"], cfg["CharaID"])
+    else:
+        times = sekai_api.get_event_time(cfg["EventID"])
+
+    if times:
+        last_time = times[-1]
+        if cfg.get("isWorldBloom"):
+            raw = sekai_api.get_chapter_rankings(cfg["EventID"], cfg["CharaID"], last_time)
+        else:
+            raw = sekai_api.get_event_rankings(cfg["EventID"], last_time)
+        used_fallback = False
+    else:
+        chara_id = cfg.get("CharaID") if cfg.get("isWorldBloom") else None
+        raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_run, chara_id)
+        if not raw:
+            raise RuntimeError("API unavailable and fallback also failed")
+        last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
+        used_fallback = True
+
+    trackings = cfg.get("Trackings") or []
+    focus_raw = cfg.get("Focus") or []
+    focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
+    all_targets = trackings + [f for f in focus_targets if f not in trackings]
+    return sekai_api.extract_scores(raw, all_targets), last_time, used_fallback
+
+_auto_prev_scores: dict[int, dict] = {}
+
 class PointInputModal(discord.ui.Modal):
     point = discord.ui.TextInput(
         label="現在のポイント",
@@ -161,36 +195,14 @@ class MissingUsersView(discord.ui.View):
 
 @registry.every_hour_at_config("LogMinutes")
 async def ranking_logger(ctx: dict) -> str:
-    from requests.exceptions import ReadTimeout, Timeout, ConnectionError as ReqConnError, RequestException
     cfg = ctx["config"]
     channel = ctx.get("channel")
     async def _run_once():
-        if cfg.get("isWorldBloom"):
-            times = sekai_api.get_chapter_time(cfg["EventID"], cfg["CharaID"])
-        else:
-            times = sekai_api.get_event_time(cfg["EventID"])
-
-        if times:
-            last_time = times[-1]
-            if cfg.get("isWorldBloom"):
-                raw = sekai_api.get_chapter_rankings(cfg["EventID"], cfg["CharaID"], last_time)
-            else:
-                raw = sekai_api.get_event_rankings(cfg["EventID"], last_time)
-            used_fallback = False
-        else:
-            chara_id = cfg.get("CharaID") if cfg.get("isWorldBloom") else None
-            raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_run, chara_id)
-            if not raw:
-                raise RuntimeError("API unavailable and fallback also failed")
-            last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
-            used_fallback = True
+        all_scores, last_time, used_fallback = await _fetch_all_scores(cfg)
 
         trackings = cfg.get("Trackings") or []
         focus_raw = cfg.get("Focus") or []
         focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
-
-        all_targets = trackings + [f for f in focus_targets if f not in trackings]
-        all_scores = sekai_api.extract_scores(raw, all_targets)
 
         rankings = {k: v for k, v in all_scores.items() if k in trackings}
         focus_scores = {k: v for k, v in all_scores.items() if k in focus_targets}
@@ -204,11 +216,6 @@ async def ranking_logger(ctx: dict) -> str:
                 "⚠️ 以下のユーザーのポイントが取得できませんでした。該当する方はボタンを押してポイントを入力してください。",
                 view=view,
             )
-
-        def _is_player(t) -> bool:
-            if isinstance(t, str):
-                return True
-            return isinstance(t, int) and len(str(abs(t))) >= 15
 
         lines = []
         player_scores = {k: v for k, v in rankings.items() if _is_player(k)}
@@ -231,6 +238,45 @@ async def ranking_logger(ctx: dict) -> str:
         attempts=3,
         catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
     )
+
+@registry.every_hour_at_config("AutoMinutes")
+async def auto_ranking_check(ctx: dict) -> str:
+    cfg = ctx["config"]
+    guild_id = ctx["guild_id"]
+    channel = ctx.get("channel")
+
+    in_auto = await asyncio.to_thread(
+        shift_manager.is_auto_period, cfg.get("SpreadsheetID"), now_jst()
+    )
+    if not in_auto:
+        return "AutoCheck(skip)"
+
+    async def _run_once():
+        scores, _, _ = await _fetch_all_scores(cfg)
+        return scores
+
+    scores = await retry_async(
+        _run_once,
+        attempts=3,
+        catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
+    )
+
+    prev = _auto_prev_scores.get(guild_id)
+    _auto_prev_scores[guild_id] = scores
+
+    if prev is None:
+        return "AutoCheck(first)"
+
+    stalled = [
+        f"{k}: {scores[k]:,}（前回 {prev[k]:,}）"
+        for k in scores
+        if _is_player(k) and k in prev and scores[k] <= prev[k]
+    ]
+    if stalled and channel:
+        await channel.send(
+            "⚠️ Auto期間中にポイント増加が確認できなかったプレイヤーがいます:\n" + "\n".join(stalled)
+        )
+    return "AutoCheck"
 
 scheduler = EventScheduler(bot, registry)
 
@@ -330,6 +376,7 @@ async def setup(interaction: discord.Interaction, text: str):
         log_interval = 60
     config["LogInterval"] = log_interval
     config["LogMinutes"] = sorted(set((m + 1) % 60 for m in range(0, 60, log_interval)))
+    config["AutoMinutes"] = list(range(0, 60, 5))
 
     guild_id = interaction.guild_id or 0
     storage.save_guild_config(guild_id, config)
@@ -342,14 +389,14 @@ async def setup(interaction: discord.Interaction, text: str):
     event_name_for_msg = config.get("EventName") or f"(ID: {event_id})"
     change_min = int(config.get("ChangeNotice") or 0)
     log_minutes_str = ", ".join(f"{m:02d}" for m in config["LogMinutes"])
+    chara_name = sekai_api._CHARA_ID_TO_NAME.get(config.get("CharaID"), str(config.get("CharaID"))) if is_wb else None
     message = (
         "設定を保存し、定期実行を登録しました。\n"
         f"- イベント名: {event_name_for_msg}\n"
-        f"- 種別: {'イベントの１チャプター' if is_wb else '通常イベント'}\n"
+        f"- 種別: {f'WL {chara_name} チャプター' if is_wb else '通常イベント'}\n"
         f"- ランナー: {runners_str}\n"
         f"- 開始: {config['EventStart']}\n"
         f"- 終了: {config['EventEnd']}\n"
-        f"- シフト通知: 毎時 {change_min:02d} 分\n"
         f"- ログ記録: {log_interval}分間隔（毎時 {log_minutes_str} 分）\n"
         f"- 投稿チャンネル: <#{config['ChannelID']}>"
     )
