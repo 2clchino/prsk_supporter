@@ -213,18 +213,18 @@ async def ranking_logger(ctx: dict) -> str:
         lines = []
         player_scores = {k: v for k, v in rankings.items() if _is_player(k)}
         for k, v in player_scores.items():
-            lines.append(f"**{k}**: {v:,}")
+            lines.append(f"{k}: {v:,}")
         for fk, fv in focus_scores.items():
             diffs = []
             for k, v in player_scores.items():
                 diff = v - fv
                 sign = "+" if diff >= 0 else ""
                 diffs.append(f"{k} {sign}{diff:,}")
-            diff_str = " / ".join(diffs) if diffs else "—"
-            lines.append(f"Focus rank{fk}: {fv:,}（{diff_str}）")
+            diff_str = ", ".join(diffs) if diffs else "—"
+            lines.append(f"{fk}: {fv:,}（{diff_str}）")
 
         suffix = " (fallback)" if used_fallback else ""
-        return "\n".join(lines) + suffix if lines else f"api checked{suffix}"
+        return "\n" + "\n".join(lines) + suffix if lines else f"api checked{suffix}"
 
     return await retry_async(
         _run_once,
@@ -336,6 +336,7 @@ async def setup(interaction: discord.Interaction, text: str):
     await scheduler.start_or_restart(guild_id, config)
     runners = config.get("Runners")
     ptlogger.format_pt_table(text, start, end, config.get("Trackings"), interval_minutes=log_interval)
+    shift_manager.format_shift_table(text, ensure_aware_jst(start), ensure_aware_jst(end))
     runners_str = ", ".join(runners) if isinstance(runners, list) else (str(runners) if runners is not None else "未設定")
     is_wb = config.get("isWorldBloom")
     event_name_for_msg = config.get("EventName") or f"(ID: {event_id})"
