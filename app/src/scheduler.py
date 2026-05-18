@@ -141,7 +141,7 @@ class EventScheduler:
         while True:
             now = now_jst()
             if now >= end:
-                await _safe_send(channel, f"⏹️ イベント期間が終了しました（End: {end}）。定期実行を停止します。")
+                await _safe_send(channel, f"イベント期間が終了しています（End: {end}）。定期処理は実行されません。")
                 break
 
             minutes = log_minutes
@@ -151,7 +151,7 @@ class EventScheduler:
             minute, target = min(candidates, key=lambda t: t[1])
 
             if target > end:
-                await _safe_send(channel, f"⏹️ 次の実行時刻がイベント終了後のため停止します（Next: {target}, End: {end}）。")
+                await _safe_send(channel, f"いべおつ！定期処理を停止します。")
                 break
 
             await asyncio.sleep(max(0.0, (target - now_jst()).total_seconds()))
@@ -169,7 +169,7 @@ class EventScheduler:
                     continue
 
                 summary = " / ".join([_shorten(str(r)) for r in results if r is not None]) or "OK"
-                await _safe_send(channel, f"⏱️ {target:%Y-%m-%d %H:%M}（毎時{minute:02d}分）定期処理完了: {summary}")
+                await _safe_send(channel, f"{target:%Y-%m-%d %H:%M} 定期処理完了: {summary}")
                 
 async def _safe_send(channel: discord.abc.Messageable, content: str) -> None:
     try:

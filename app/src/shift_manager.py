@@ -19,6 +19,8 @@ def format_shift_table(
     if gap_cols < 0:
         raise ValueError("gap_cols must be >= 0")
     sh = gspread_manager.load_sheet(spreadsheet_id)
+    if any(ws.title == sheet_title for ws in sh.worksheets()):
+        return sheet_title
     start_h = start.replace(minute=0, second=0, microsecond=0)
     end_h   = end.replace(minute=0, second=0, microsecond=0)
 

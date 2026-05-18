@@ -142,6 +142,7 @@ async def _fetch_all_scores(cfg: dict) -> tuple[dict, str, bool]:
     return sekai_api.extract_scores(raw, all_targets), last_time, used_fallback
 
 _auto_prev_scores: dict[int, dict] = {}
+_logger_prev_scores: dict[int, dict] = {}
 
 class PointInputModal(discord.ui.Modal):
     point = discord.ui.TextInput(
@@ -196,6 +197,7 @@ class MissingUsersView(discord.ui.View):
 @registry.every_hour_at_config("LogMinutes")
 async def ranking_logger(ctx: dict) -> str:
     cfg = ctx["config"]
+    guild_id = ctx["guild_id"]
     channel = ctx.get("channel")
     async def _run_once():
         all_scores, last_time, used_fallback = await _fetch_all_scores(cfg)
@@ -204,8 +206,8 @@ async def ranking_logger(ctx: dict) -> str:
         focus_raw = cfg.get("Focus") or []
         focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
 
-        rankings = {k: v for k, v in all_scores.items() if k in trackings}
-        focus_scores = {k: v for k, v in all_scores.items() if k in focus_targets}
+        rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
+        focus_scores = {k: v for k, v in all_scores.items() if k in focus_targets and v is not None}
 
         ptlogger.write_values(cfg["SpreadsheetID"], last_time, rankings)
 
@@ -217,18 +219,38 @@ async def ranking_logger(ctx: dict) -> str:
                 view=view,
             )
 
-        lines = []
+        log_interval = cfg.get("LogInterval", 30)
+        rate_mult = max(1, 60 // log_interval)
+        prev = _logger_prev_scores.get(guild_id, {})
+
+        def hourly(k, v) -> str:
+            pv = prev.get(k)
+            if pv is None:
+                return ""
+            r = (v - pv) * rate_mult
+            sign = "+" if r >= 0 else ""
+            return f"（{sign}{r:,}/h）"
+
         player_scores = {k: v for k, v in rankings.items() if _is_player(k)}
+
+        lines = []
         for k, v in player_scores.items():
-            lines.append(f"{k}: {v:,}")
-        for fk, fv in focus_scores.items():
-            diffs = []
-            for k, v in player_scores.items():
-                diff = v - fv
-                sign = "+" if diff >= 0 else ""
-                diffs.append(f"{k} {sign}{diff:,}")
-            diff_str = ", ".join(diffs) if diffs else "—"
-            lines.append(f"{fk}: {fv:,}（{diff_str}）")
+            lines.append(f"{k}: {v:,} {hourly(k, v)}".rstrip())
+
+        if focus_scores:
+            if lines:
+                lines.append("")
+            for fk, fv in focus_scores.items():
+                diffs = " | ".join(
+                    f"{k} の差: {'+'if v-fv>=0 else '-'}{v-fv:,}"
+                    for k, v in player_scores.items()
+                )
+                focus_line = f"{fk}: {fv:,} {hourly(fk, fv)}".rstrip()
+                if diffs:
+                    focus_line += f"\n  {diffs}"
+                lines.append(focus_line)
+
+        _logger_prev_scores[guild_id] = {**player_scores, **focus_scores}
 
         suffix = " (fallback)" if used_fallback else ""
         return "\n" + "\n".join(lines) + suffix if lines else f"api checked{suffix}"
@@ -270,19 +292,27 @@ async def auto_ranking_check(ctx: dict) -> str:
     stalled = [
         f"{k}: {scores[k]:,}（前回 {prev[k]:,}）"
         for k in scores
-        if _is_player(k) and k in prev and scores[k] <= prev[k]
+        if _is_player(k) and k in prev and scores[k] is not None and prev[k] is not None and scores[k] <= prev[k]
     ]
     if stalled and channel:
         await channel.send(
-            "⚠️ Auto期間中にポイント増加が確認できなかったプレイヤーがいます:\n" + "\n".join(stalled)
+            "⚠️ オート期間中にポイント増加が確認できませんでした。次のユーザは端末を確認してください:\n" + "\n".join(stalled)
         )
     return "AutoCheck"
 
 scheduler = EventScheduler(bot, registry)
 
 @bot.event
+async def on_guild_join(guild: discord.Guild):
+    await bot.tree.sync(guild=guild)
+    print(f"Synced commands to new guild {guild.id}")
+
+@bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})")
+    for guild in bot.guilds:
+        await bot.tree.sync(guild=guild)
+    print(f"Synced commands to {len(bot.guilds)} guild(s)")
     saved = storage.load_all_configs()
     for guild_id, cfg in saved.items():
         try:
@@ -379,6 +409,7 @@ async def setup(interaction: discord.Interaction, text: str):
     config["AutoMinutes"] = list(range(0, 60, 5))
 
     guild_id = interaction.guild_id or 0
+    is_update = storage.load_guild_config(guild_id) is not None
     storage.save_guild_config(guild_id, config)
     await scheduler.start_or_restart(guild_id, config)
     runners = config.get("Runners")
@@ -390,8 +421,9 @@ async def setup(interaction: discord.Interaction, text: str):
     change_min = int(config.get("ChangeNotice") or 0)
     log_minutes_str = ", ".join(f"{m:02d}" for m in config["LogMinutes"])
     chara_name = sekai_api._CHARA_ID_TO_NAME.get(config.get("CharaID"), str(config.get("CharaID"))) if is_wb else None
+    prefix = "Updated: " if is_update else ""
     message = (
-        "設定を保存し、定期実行を登録しました。\n"
+        f"{prefix}設定を保存し、定期実行を登録しました。\n"
         f"- イベント名: {event_name_for_msg}\n"
         f"- 種別: {f'WL {chara_name} チャプター' if is_wb else '通常イベント'}\n"
         f"- ランナー: {runners_str}\n"

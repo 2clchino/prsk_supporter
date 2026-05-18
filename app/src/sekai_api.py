@@ -189,6 +189,10 @@ def extract_scores(rankings: List[Dict[str, Any]],
         user_id   = entry.get("userId")
         user_id_str = str(user_id) if user_id is not None else None
         score_val = entry.get("score")
+        try:
+            score_val = int(score_val)
+        except (TypeError, ValueError):
+            score_val = None
         for t in targets:
             if is_userid_like(t):
                 if user_id_str is not None and user_id_str == str(t):
