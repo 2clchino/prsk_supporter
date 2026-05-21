@@ -1,4 +1,4 @@
-# prsk-supporter
+# PRSK Supporter Bot
 
 プロセカイベントの支援者向け Discord bot。ランキング自動取得・スプレッドシート記録・シフト管理を行う。
 
