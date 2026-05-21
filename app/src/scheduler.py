@@ -132,44 +132,56 @@ class EventScheduler:
         channel_id = cfg.get("ChannelID")
         if not channel_id:
             return
-        channel = self.bot.get_channel(int(channel_id)) or await self.bot.fetch_channel(int(channel_id))
+        try:
+            channel = self.bot.get_channel(int(channel_id)) or await self.bot.fetch_channel(int(channel_id))
+        except Exception as e:
+            print(f"[ERROR] guild {guild_id}: failed to get channel: {type(e).__name__}: {e}")
+            return
 
         start = ensure_aware_jst(cfg["EventStart"])
         end   = ensure_aware_jst(cfg["EventEnd"])
         log_minutes = _compute_log_minutes(cfg)
 
         while True:
-            now = now_jst()
-            if now >= end:
-                await _safe_send(channel, f"イベント期間が終了しています（End: {end}）。定期処理は実行されません。")
-                break
+            try:
+                now = now_jst()
+                if now >= end:
+                    await _safe_send(channel, f"イベント期間が終了しています（End: {end}）。定期処理は実行されません。")
+                    break
 
-            minutes = log_minutes
+                minutes = log_minutes
 
-            base = start if now < start else now
-            candidates = [(m, first_tick_on_or_after(base, m)) for m in minutes]
-            minute, target = min(candidates, key=lambda t: t[1])
+                base = start if now < start else now
+                candidates = [(m, first_tick_on_or_after(base, m)) for m in minutes]
+                minute, target = min(candidates, key=lambda t: t[1])
 
-            if target > end:
-                await _safe_send(channel, f"いべおつ！定期処理を停止します。")
-                break
+                if target > end:
+                    await _safe_send(channel, f"いべおつ！定期処理を停止します。")
+                    break
 
-            await asyncio.sleep(max(0.0, (target - now_jst()).total_seconds()))
+                await asyncio.sleep(max(0.0, (target - now_jst()).total_seconds()))
 
-            tick_iso = target.strftime("%Y-%m-%dT%H:%M:%S%z")
-            if not storage.mark_tick_if_new(guild_id, tick_iso):
-                continue
-
-            if start <= target <= end:
-                ctx = {"guild_id": guild_id, "config": cfg, "now": target, "channel": channel}
-                try:
-                    results = await self.registry.run_for_minute(minute, ctx)
-                except Exception as e:
-                    await _safe_send(channel, f"⚠️ 毎時処理でエラー: {type(e).__name__}: {e}")
+                tick_iso = target.strftime("%Y-%m-%dT%H:%M:%S%z")
+                if not storage.mark_tick_if_new(guild_id, tick_iso):
                     continue
 
-                summary = " / ".join([_shorten(str(r)) for r in results if r is not None]) or "OK"
-                await _safe_send(channel, f"{target:%Y-%m-%d %H:%M} 定期処理完了: {summary}")
+                if start <= target <= end:
+                    ctx = {"guild_id": guild_id, "config": cfg, "now": target, "channel": channel}
+                    try:
+                        results = await self.registry.run_for_minute(minute, ctx)
+                    except Exception as e:
+                        await _safe_send(channel, f"⚠️ 毎時処理でエラー: {type(e).__name__}: {e}")
+                        continue
+
+                    summary = " / ".join([_shorten(str(r)) for r in results if r is not None]) or "OK"
+                    await _safe_send(channel, f"{target:%Y-%m-%d %H:%M} 定期処理完了: {summary}")
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[ERROR] guild {guild_id}: _event_loop iteration crashed: {type(e).__name__}: {e}")
+                await _safe_send(channel, f"⚠️ スケジューラでエラーが発生しました: {type(e).__name__}: {e}")
+                await asyncio.sleep(60)
                 
 async def _safe_send(channel: discord.abc.Messageable, content: str) -> None:
     try:

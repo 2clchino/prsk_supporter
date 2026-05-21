@@ -241,13 +241,11 @@ async def ranking_logger(ctx: dict) -> str:
             if lines:
                 lines.append("")
             for fk, fv in focus_scores.items():
-                diffs = " | ".join(
-                    f"{k} の差: {'+'if v-fv>=0 else '-'}{v-fv:,}"
-                    for k, v in player_scores.items()
-                )
                 focus_line = f"{fk}: {fv:,} {hourly(fk, fv)}".rstrip()
-                if diffs:
-                    focus_line += f"\n  {diffs}"
+                for k, v in player_scores.items():
+                    diff = v - fv
+                    sign = "+" if diff >= 0 else ""
+                    focus_line += f"\n   | {k} {sign}{diff:,}"
                 lines.append(focus_line)
 
         _logger_prev_scores[guild_id] = {**player_scores, **focus_scores}
@@ -304,6 +302,7 @@ scheduler = EventScheduler(bot, registry)
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
+    bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
     print(f"Synced commands to new guild {guild.id}")
 
@@ -311,24 +310,55 @@ async def on_guild_join(guild: discord.Guild):
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})")
     for guild in bot.guilds:
-        await bot.tree.sync(guild=guild)
-    print(f"Synced commands to {len(bot.guilds)} guild(s)")
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"Synced {len(synced)} commands to guild {guild.id} ({guild.name})")
+        except Exception as e:
+            print(f"[WARN] Failed to sync commands to guild {guild.id} ({guild.name}): {e}")
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync()
+    print("Cleared global commands")
     saved = storage.load_all_configs()
+    print(f"Restoring {len(saved)} guild config(s): {list(saved.keys())}")
     for guild_id, cfg in saved.items():
         try:
-            scheduler_running = scheduler.is_running(guild_id)
             await scheduler.start_or_restart(guild_id, cfg)
+            print(f"Restored scheduler for guild {guild_id}")
         except Exception as e:
-            print(f"[WARN] restore failed for guild {guild_id}: {e}")
+            print(f"[WARN] restore failed for guild {guild_id}: {type(e).__name__}: {e}")
 
-@bot.tree.command(name="ping", description="Ping-Pong!")
+@bot.tree.command(name="help", description="botの使い方を表示")
+async def help_command(interaction: discord.Interaction):
+    msg = (
+        "**プロセカ支援者用bot ヘルプ**\n"
+        "\n"
+        "__**セットアップ**__\n"
+        "`/setup <スプレッドシートID>` — イベント設定を読み込み、定期実行を開始します。\n"
+        "　スプレッドシートには 'Config' シートを作成し後に示す項目を記入してください。 \n"
+        "　初回実行時に 'PtLogs' シートと 'Shift' シートを作成・フォーマットします。\n"
+        "`/status` — 現在の設定とスケジューラの状態を表示します。\n"
+        "`/clear_setup` — 設定を削除し、定期実行を停止します。\n"
+        "\n"
+        "__**スプレッドシート設定項目**__\n"
+        "`EventName` — イベント名（部分一致）\n"
+        "`ChapterNo` — WL チャプター番号（通常イベントは0または省略）\n"
+        "`Trackings` — 記録するユーザー名または順位のリスト\n"
+        "`Focus` — 差分を表示する順位\n"
+        "`Runners` — ランナーのリスト\n"
+        "`LogInterval` — ログ記録間隔（分）\n"
+        "`ChangeNotice` — シフト通知を送る分（例: 55）\n"
+        "\n"
+        "__**定期実行（設定後に自動で動作）**__\n"
+        "`ランキングログ` — LogInterval 分ごとにランキングを取得し、スプレッドシートに記録・チャンネルに投稿します。\n"
+        "`シフト通知` — ChangeNotice で指定した時刻に直近のシフトをチャンネルに投稿します。(現在機能していません)\n"
+        "`Autoチェック` — シフトシートで Auto と記入された時間帯に5分ごとポイント増加を監視します。\n"
+    )
+    await interaction.response.send_message(msg, ephemeral=False)
+
+@bot.tree.command(name="ping", description="動作確認用。'Ping-Pong!'の文字列を返却")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("PongPong!")
-
-@bot.tree.command(name="echo", description="そのまま返す")
-@app_commands.describe(text="返してほしいテキスト")
-async def echo(interaction: discord.Interaction, text: str):
-    await interaction.response.send_message(text, ephemeral=True)
     
 @bot.tree.command(name="setup", description="スプレッドシートのセットアップ")
 @app_commands.describe(text="スプレッドシートID")
@@ -433,6 +463,48 @@ async def setup(interaction: discord.Interaction, text: str):
         f"- 投稿チャンネル: <#{config['ChannelID']}>"
     )
     await interaction.followup.send(message, ephemeral=True)
+
+@bot.tree.command(name="status", description="現在の設定・スケジューラの状態を表示")
+async def status(interaction: discord.Interaction):
+    guild_id = interaction.guild_id or 0
+    config = storage.load_guild_config(guild_id)
+    if not config:
+        await interaction.response.send_message("設定がありません。`/setup` で設定してください。", ephemeral=True)
+        return
+
+    is_wb = config.get("isWorldBloom")
+    event_name_for_msg = config.get("EventName") or f"(ID: {config.get('EventID')})"
+    chara_name = sekai_api._CHARA_ID_TO_NAME.get(config.get("CharaID"), str(config.get("CharaID"))) if is_wb else None
+    runners = config.get("Runners")
+    runners_str = ", ".join(runners) if isinstance(runners, list) else (str(runners) if runners is not None else "未設定")
+    log_interval = config.get("LogInterval", 60)
+    log_minutes_str = ", ".join(f"{m:02d}" for m in config.get("LogMinutes", []))
+    if not scheduler.is_running(guild_id):
+        try:
+            await scheduler.start_or_restart(guild_id, config)
+            print(f"[status] auto-restarted scheduler for guild {guild_id}")
+        except Exception as e:
+            print(f"[status] failed to auto-restart scheduler for guild {guild_id}: {e}")
+    is_running = scheduler.is_running(guild_id)
+    if not is_running:
+        status_str = "⏹ 停止中"
+    else:
+        try:
+            event_start = ensure_aware_jst(config.get("EventStart"))
+            status_str = "⏸ イベント待機中" if now_jst() < event_start else "▶ 稼働中"
+        except Exception:
+            status_str = "▶ 稼働中"
+    message = (
+        f"{status_str}\n"
+        f"- イベント名: {event_name_for_msg}\n"
+        f"- 種別: {f'WL {chara_name} チャプター' if is_wb else '通常イベント'}\n"
+        f"- ランナー: {runners_str}\n"
+        f"- 開始: {config.get('EventStart')}\n"
+        f"- 終了: {config.get('EventEnd')}\n"
+        f"- ログ記録: {log_interval}分間隔（毎時 {log_minutes_str} 分）\n"
+        f"- 投稿チャンネル: <#{config.get('ChannelID')}>"
+    )
+    await interaction.response.send_message(message, ephemeral=True)
 
 @bot.tree.command(name="clear_setup", description="保存済み設定を削除します（実行も停止）")
 async def clear_setup(interaction: discord.Interaction):
