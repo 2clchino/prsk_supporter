@@ -141,8 +141,8 @@ async def _fetch_all_scores(cfg: dict) -> tuple[dict, str, bool]:
     all_targets = trackings + [f for f in focus_targets if f not in trackings]
     return sekai_api.extract_scores(raw, all_targets), last_time, used_fallback
 
-_auto_prev_scores: dict[int, dict] = {}
-_logger_prev_scores: dict[int, dict] = {}
+_auto_prev_scores: dict[tuple, dict] = {}
+_logger_prev_scores: dict[tuple, dict] = {}
 
 class PointInputModal(discord.ui.Modal):
     point = discord.ui.TextInput(
@@ -198,6 +198,7 @@ class MissingUsersView(discord.ui.View):
 async def ranking_logger(ctx: dict) -> str:
     cfg = ctx["config"]
     guild_id = ctx["guild_id"]
+    spreadsheet_id = ctx["spreadsheet_id"]
     channel = ctx.get("channel")
     async def _run_once():
         all_scores, last_time, used_fallback = await _fetch_all_scores(cfg)
@@ -221,7 +222,7 @@ async def ranking_logger(ctx: dict) -> str:
 
         log_interval = cfg.get("LogInterval", 30)
         rate_mult = max(1, 60 // log_interval)
-        prev = _logger_prev_scores.get(guild_id, {})
+        prev = _logger_prev_scores.get((guild_id, spreadsheet_id), {})
 
         def hourly(k, v) -> str:
             pv = prev.get(k)
@@ -233,6 +234,10 @@ async def ranking_logger(ctx: dict) -> str:
 
         player_scores = {k: v for k, v in rankings.items() if _is_player(k)}
 
+        runners_raw = cfg.get("Runners") or []
+        runners_list = runners_raw if isinstance(runners_raw, list) else ([runners_raw] if runners_raw else [])
+        tracking_to_runner = {t: runners_list[i] for i, t in enumerate(trackings) if i < len(runners_list)}
+
         lines = []
         for k, v in player_scores.items():
             lines.append(f"{k}: {v:,} {hourly(k, v)}".rstrip())
@@ -243,12 +248,13 @@ async def ranking_logger(ctx: dict) -> str:
             for fk, fv in focus_scores.items():
                 focus_line = f"{fk}: {fv:,} {hourly(fk, fv)}".rstrip()
                 for k, v in player_scores.items():
+                    display = tracking_to_runner.get(k, k)
                     diff = v - fv
                     sign = "+" if diff >= 0 else ""
-                    focus_line += f"\n   | {k} {sign}{diff:,}"
+                    focus_line += f"\n   | {display} {sign}{diff:,}"
                 lines.append(focus_line)
 
-        _logger_prev_scores[guild_id] = {**player_scores, **focus_scores}
+        _logger_prev_scores[(guild_id, spreadsheet_id)] = {**player_scores, **focus_scores}
 
         suffix = " (fallback)" if used_fallback else ""
         return "\n" + "\n".join(lines) + suffix if lines else f"api checked{suffix}"
@@ -263,6 +269,7 @@ async def ranking_logger(ctx: dict) -> str:
 async def auto_ranking_check(ctx: dict) -> str:
     cfg = ctx["config"]
     guild_id = ctx["guild_id"]
+    spreadsheet_id = ctx["spreadsheet_id"]
     channel = ctx.get("channel")
 
     in_auto = await asyncio.to_thread(
@@ -281,8 +288,9 @@ async def auto_ranking_check(ctx: dict) -> str:
         catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
     )
 
-    prev = _auto_prev_scores.get(guild_id)
-    _auto_prev_scores[guild_id] = scores
+    key = (guild_id, spreadsheet_id)
+    prev = _auto_prev_scores.get(key)
+    _auto_prev_scores[key] = scores
 
     if prev is None:
         return "AutoCheck(first)"
@@ -320,13 +328,13 @@ async def on_ready():
     await bot.tree.sync()
     print("Cleared global commands")
     saved = storage.load_all_configs()
-    print(f"Restoring {len(saved)} guild config(s): {list(saved.keys())}")
-    for guild_id, cfg in saved.items():
+    print(f"Restoring {len(saved)} scheduler(s): {list(saved.keys())}")
+    for (guild_id, spreadsheet_id), cfg in saved.items():
         try:
-            await scheduler.start_or_restart(guild_id, cfg)
-            print(f"Restored scheduler for guild {guild_id}")
+            await scheduler.start_or_restart(guild_id, spreadsheet_id, cfg)
+            print(f"Restored scheduler for guild {guild_id} / ss {spreadsheet_id}")
         except Exception as e:
-            print(f"[WARN] restore failed for guild {guild_id}: {type(e).__name__}: {e}")
+            print(f"[WARN] restore failed for guild {guild_id} / ss {spreadsheet_id}: {type(e).__name__}: {e}")
 
 @bot.tree.command(name="help", description="botの使い方を表示")
 async def help_command(interaction: discord.Interaction):
@@ -439,9 +447,9 @@ async def setup(interaction: discord.Interaction, text: str):
     config["AutoMinutes"] = list(range(0, 60, 5))
 
     guild_id = interaction.guild_id or 0
-    is_update = storage.load_guild_config(guild_id) is not None
+    is_update = storage.load_guild_config(guild_id, text) is not None
     storage.save_guild_config(guild_id, config)
-    await scheduler.start_or_restart(guild_id, config)
+    await scheduler.start_or_restart(guild_id, text, config)
     runners = config.get("Runners")
     ptlogger.format_pt_table(text, start, end, config.get("Trackings"), interval_minutes=log_interval)
     shift_manager.format_shift_table(text, ensure_aware_jst(start), ensure_aware_jst(end))
@@ -467,51 +475,88 @@ async def setup(interaction: discord.Interaction, text: str):
 @bot.tree.command(name="status", description="現在の設定・スケジューラの状態を表示")
 async def status(interaction: discord.Interaction):
     guild_id = interaction.guild_id or 0
-    config = storage.load_guild_config(guild_id)
-    if not config:
+    all_configs = storage.load_all_guild_configs(guild_id)
+    if not all_configs:
         await interaction.response.send_message("設定がありません。`/setup` で設定してください。", ephemeral=True)
         return
 
-    is_wb = config.get("isWorldBloom")
-    event_name_for_msg = config.get("EventName") or f"(ID: {config.get('EventID')})"
-    chara_name = sekai_api._CHARA_ID_TO_NAME.get(config.get("CharaID"), str(config.get("CharaID"))) if is_wb else None
-    runners = config.get("Runners")
-    runners_str = ", ".join(runners) if isinstance(runners, list) else (str(runners) if runners is not None else "未設定")
-    log_interval = config.get("LogInterval", 60)
-    log_minutes_str = ", ".join(f"{m:02d}" for m in config.get("LogMinutes", []))
-    if not scheduler.is_running(guild_id):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    blocks = []
+    multi = len(all_configs) > 1
+    for spreadsheet_id, config in all_configs.items():
+        is_wb = config.get("isWorldBloom")
+        event_name_for_msg = config.get("EventName") or f"(ID: {config.get('EventID')})"
+        chara_name = sekai_api._CHARA_ID_TO_NAME.get(config.get("CharaID"), str(config.get("CharaID"))) if is_wb else None
+        runners = config.get("Runners")
+        runners_str = ", ".join(runners) if isinstance(runners, list) else (str(runners) if runners is not None else "未設定")
+        log_interval = config.get("LogInterval", 60)
+        log_minutes_str = ", ".join(f"{m:02d}" for m in config.get("LogMinutes", []))
+
+        if not scheduler.is_running(guild_id, spreadsheet_id):
+            try:
+                await scheduler.start_or_restart(guild_id, spreadsheet_id, config)
+                print(f"[status] auto-restarted scheduler for guild {guild_id} / ss {spreadsheet_id}")
+            except Exception as e:
+                print(f"[status] failed to auto-restart for guild {guild_id} / ss {spreadsheet_id}: {e}")
+        is_running = scheduler.is_running(guild_id, spreadsheet_id)
+        if not is_running:
+            status_str = "⏹ 停止中"
+        else:
+            try:
+                event_start = ensure_aware_jst(config.get("EventStart"))
+                status_str = "⏸ イベント待機中" if now_jst() < event_start else "▶ 稼働中"
+            except Exception:
+                status_str = "▶ 稼働中"
+
         try:
-            await scheduler.start_or_restart(guild_id, config)
-            print(f"[status] auto-restarted scheduler for guild {guild_id}")
-        except Exception as e:
-            print(f"[status] failed to auto-restart scheduler for guild {guild_id}: {e}")
-    is_running = scheduler.is_running(guild_id)
-    if not is_running:
-        status_str = "⏹ 停止中"
-    else:
-        try:
-            event_start = ensure_aware_jst(config.get("EventStart"))
-            status_str = "⏸ イベント待機中" if now_jst() < event_start else "▶ 稼働中"
+            today = now_jst().date()
+            auto_hours = await asyncio.to_thread(
+                shift_manager.get_auto_hours, config.get("SpreadsheetID"), today
+            )
+            if auto_hours:
+                ranges, rng_start = [], auto_hours[0]
+                for prev, cur in zip(auto_hours, auto_hours[1:]):
+                    if cur != prev + 1:
+                        ranges.append((rng_start, prev))
+                        rng_start = cur
+                ranges.append((rng_start, auto_hours[-1]))
+                auto_str = ", ".join(
+                    f"{s:02d}:00" if s == e else f"{s:02d}:00-{e:02d}:00"
+                    for s, e in ranges
+                )
+            else:
+                auto_str = "なし"
         except Exception:
-            status_str = "▶ 稼働中"
-    message = (
-        f"{status_str}\n"
-        f"- イベント名: {event_name_for_msg}\n"
-        f"- 種別: {f'WL {chara_name} チャプター' if is_wb else '通常イベント'}\n"
-        f"- ランナー: {runners_str}\n"
-        f"- 開始: {config.get('EventStart')}\n"
-        f"- 終了: {config.get('EventEnd')}\n"
-        f"- ログ記録: {log_interval}分間隔（毎時 {log_minutes_str} 分）\n"
-        f"- 投稿チャンネル: <#{config.get('ChannelID')}>"
-    )
-    await interaction.response.send_message(message, ephemeral=True)
+            auto_str = "取得失敗"
+
+        ss_label = f"`...{spreadsheet_id[-8:]}`" if multi else ""
+        header = f"{status_str}{' — ' + ss_label if ss_label else ''}"
+        block = (
+            f"{header}\n"
+            f"- イベント名: {event_name_for_msg}\n"
+            f"- 種別: {f'WL {chara_name} チャプター' if is_wb else '通常イベント'}\n"
+            f"- ランナー: {runners_str}\n"
+            f"- 開始: {config.get('EventStart')}\n"
+            f"- 終了: {config.get('EventEnd')}\n"
+            f"- ログ記録: {log_interval}分間隔（毎時 {log_minutes_str} 分）\n"
+            f"- Auto監視（本日）: {auto_str}\n"
+            f"- 投稿チャンネル: <#{config.get('ChannelID')}>"
+        )
+        blocks.append(block)
+
+    await interaction.followup.send("\n\n".join(blocks), ephemeral=True)
 
 @bot.tree.command(name="clear_setup", description="保存済み設定を削除します（実行も停止）")
-async def clear_setup(interaction: discord.Interaction):
+@app_commands.describe(spreadsheet_id="削除するスプレッドシートID（省略すると全削除）")
+async def clear_setup(interaction: discord.Interaction, spreadsheet_id: str = None):
     guild_id = interaction.guild_id or 0
-    scheduler.stop(guild_id)
-    storage.delete_guild_config(guild_id)
-    await interaction.response.send_message("設定を削除しました。", ephemeral=True)
+    await scheduler.stop(guild_id, spreadsheet_id)
+    storage.delete_guild_config(guild_id, spreadsheet_id)
+    if spreadsheet_id:
+        await interaction.response.send_message(f"`...{spreadsheet_id[-8:]}` の設定を削除しました。", ephemeral=True)
+    else:
+        await interaction.response.send_message("全ての設定を削除しました。", ephemeral=True)
 
 @bot.tree.error
 async def on_app_command_error(

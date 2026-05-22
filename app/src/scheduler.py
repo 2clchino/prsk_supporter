@@ -1,7 +1,7 @@
 # scheduler.py
 from __future__ import annotations
 import asyncio
-from typing import Awaitable, Callable, Dict, List, Any, Optional
+from typing import Awaitable, Callable, Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 import os, uuid
 INSTANCE_ID = os.environ.get("INSTANCE_ID", str(uuid.uuid4()))
@@ -97,38 +97,50 @@ async def _to_thread(fn, *a, **kw):
     import asyncio
     return await asyncio.to_thread(fn, *a, **kw)
 
+JobKey = Tuple[int, str]  # (guild_id, spreadsheet_id)
+
 @dataclass
 class ManagedJob:
     task: asyncio.Task
     guild_id: int
+    spreadsheet_id: str
 
 class EventScheduler:
     def __init__(self, bot: discord.Client, registry: MultiMinuteRegistry) -> None:
         self.bot = bot
         self.registry = registry
-        self.jobs: Dict[int, ManagedJob] = {}
-        self._locks: Dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.jobs: Dict[JobKey, ManagedJob] = {}
+        self._locks: Dict[JobKey, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-    def is_running(self, guild_id: int) -> bool:
-        return guild_id in self.jobs and not self.jobs[guild_id].task.done()
+    def is_running(self, guild_id: int, spreadsheet_id: str) -> bool:
+        key = (guild_id, spreadsheet_id)
+        return key in self.jobs and not self.jobs[key].task.done()
 
-    async def start_or_restart(self, guild_id: int, cfg: dict) -> None:
-        async with self._locks[guild_id]:
-            await self.stop(guild_id)
-            loop_task = asyncio.create_task(self._event_loop(guild_id, cfg))
-            self.jobs[guild_id] = ManagedJob(task=loop_task, guild_id=guild_id)
+    def running_spreadsheets(self, guild_id: int) -> List[str]:
+        return [ss_id for (gid, ss_id), job in self.jobs.items()
+                if gid == guild_id and not job.task.done()]
 
-    async def stop(self, guild_id: int) -> None:
-        job = self.jobs.get(guild_id)
-        if job and not job.task.done():
-            job.task.cancel()
-            try:
-                await job.task
-            except asyncio.CancelledError:
-                pass
-        self.jobs.pop(guild_id, None)
+    async def start_or_restart(self, guild_id: int, spreadsheet_id: str, cfg: dict) -> None:
+        key = (guild_id, spreadsheet_id)
+        async with self._locks[key]:
+            await self.stop(guild_id, spreadsheet_id)
+            loop_task = asyncio.create_task(self._event_loop(guild_id, spreadsheet_id, cfg))
+            self.jobs[key] = ManagedJob(task=loop_task, guild_id=guild_id, spreadsheet_id=spreadsheet_id)
 
-    async def _event_loop(self, guild_id: int, cfg: dict) -> None:
+    async def stop(self, guild_id: int, spreadsheet_id: str = None) -> None:
+        keys = [(guild_id, spreadsheet_id)] if spreadsheet_id else \
+               [k for k in list(self.jobs) if k[0] == guild_id]
+        for key in keys:
+            job = self.jobs.get(key)
+            if job and not job.task.done():
+                job.task.cancel()
+                try:
+                    await job.task
+                except asyncio.CancelledError:
+                    pass
+            self.jobs.pop(key, None)
+
+    async def _event_loop(self, guild_id: int, spreadsheet_id: str, cfg: dict) -> None:
         channel_id = cfg.get("ChannelID")
         if not channel_id:
             return
@@ -162,11 +174,11 @@ class EventScheduler:
                 await asyncio.sleep(max(0.0, (target - now_jst()).total_seconds()))
 
                 tick_iso = target.strftime("%Y-%m-%dT%H:%M:%S%z")
-                if not storage.mark_tick_if_new(guild_id, tick_iso):
+                if not storage.mark_tick_if_new(guild_id, spreadsheet_id, tick_iso):
                     continue
 
                 if start <= target <= end:
-                    ctx = {"guild_id": guild_id, "config": cfg, "now": target, "channel": channel}
+                    ctx = {"guild_id": guild_id, "spreadsheet_id": spreadsheet_id, "config": cfg, "now": target, "channel": channel}
                     try:
                         results = await self.registry.run_for_minute(minute, ctx)
                     except Exception as e:

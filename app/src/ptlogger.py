@@ -22,6 +22,13 @@ def format_pt_table(spreadsheet_id: str,
 
     n_rows = 1 + len(times)
     n_cols = 2 + max(len(trackings), 0)
+
+    existing = next((ws for ws in sh.worksheets() if ws.title == sheet_title), None)
+    if existing is not None:
+        if existing.row_count == n_rows:
+            return
+        sh.del_worksheet(existing)
+
     ws = gspread_manager.create_sheet(sh, sheet_title, n_rows, max(n_cols, 2))
 
     header = ["日付", "時間"] + [str(x) for x in trackings]

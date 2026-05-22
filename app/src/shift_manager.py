@@ -19,8 +19,6 @@ def format_shift_table(
     if gap_cols < 0:
         raise ValueError("gap_cols must be >= 0")
     sh = gspread_manager.load_sheet(spreadsheet_id)
-    if any(ws.title == sheet_title for ws in sh.worksheets()):
-        return sheet_title
     start_h = start.replace(minute=0, second=0, microsecond=0)
     end_h   = end.replace(minute=0, second=0, microsecond=0)
 
@@ -30,6 +28,16 @@ def format_shift_table(
     while d <= end_d:
         days.append(d)
         d += timedelta(days=1)
+
+    expected_dates = {day.strftime("%Y-%m-%d") for day in days}
+    existing = next((ws for ws in sh.worksheets() if ws.title == sheet_title), None)
+    if existing is not None:
+        header = existing.row_values(1)
+        existing_dates = {v.strip() for v in header if DATE_RE.match(v.strip())}
+        if existing_dates == expected_dates:
+            return sheet_title
+        sh.del_worksheet(existing)
+
     total_rows = 25
     total_cols = 1 + (len(days) - 1) * (1 + gap_cols) + gap_cols if days else 1 + gap_cols
     ws = gspread_manager.create_sheet(sh, sheet_title, total_rows, total_cols)
@@ -201,6 +209,42 @@ def is_auto_period(
                 if c < len(data[r]) and data[r][c].strip().lower() == "auto":
                     return True
     return False
+
+
+def get_auto_hours(
+    spreadsheet_id: str,
+    date,
+    sheet_title: str = "Shift",
+) -> list[int]:
+    """Return sorted list of hours (0-23) that have 'Auto' in any shifter column for the given date."""
+    tz = ZoneInfo("Asia/Tokyo")
+    try:
+        data = gspread_manager.load_table(spreadsheet_id, sheet_title)
+    except Exception:
+        return []
+    if not data or len(data) < 2:
+        return []
+
+    date_cols = find_date_columns(data[0])
+    hours = []
+    for i, date_col in enumerate(date_cols):
+        col_date = parse_date(data[0][date_col].strip(), tz)
+        if col_date != date:
+            continue
+        next_date_col = date_cols[i + 1] if i + 1 < len(date_cols) else len(data[0])
+        for r in range(1, len(data)):
+            tstr = data[r][date_col].strip() if date_col < len(data[r]) else ""
+            if TIME_RE.match(tstr):
+                h = int(tstr.split(":")[0])
+            elif r <= 24:
+                h = r - 1  # row 1 = 00:00, row 2 = 01:00, ...
+            else:
+                continue
+            for c in range(date_col + 1, next_date_col):
+                if c < len(data[r]) and data[r][c].strip().lower() == "auto":
+                    hours.append(h)
+                    break
+    return sorted(hours)
 
 
 def count_runners(value):
