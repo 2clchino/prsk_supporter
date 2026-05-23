@@ -109,6 +109,12 @@ async def retry_async(call, *, attempts: int = 3, catch: Tuple[type, ...] = (Exc
     raise last
 from requests.exceptions import Timeout, ReadTimeout, ConnectionError as ReqConnError, RequestException
 
+def _tracking_to_runner(cfg: dict) -> dict:
+    trackings = cfg.get("Trackings") or []
+    runners_raw = cfg.get("Runners") or []
+    runners_list = runners_raw if isinstance(runners_raw, list) else ([runners_raw] if runners_raw else [])
+    return {t: runners_list[i] for i, t in enumerate(trackings) if i < len(runners_list)}
+
 def _is_player(t) -> bool:
     if isinstance(t, str):
         return True
@@ -129,7 +135,7 @@ async def _fetch_all_scores(cfg: dict) -> tuple[dict, str, bool]:
         used_fallback = False
     else:
         chara_id = cfg.get("CharaID") if cfg.get("isWorldBloom") else None
-        raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_run, chara_id)
+        raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_ing, chara_id)
         if not raw:
             raise RuntimeError("API unavailable and fallback also failed")
         last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -151,11 +157,13 @@ class PointInputModal(discord.ui.Modal):
         max_length=20,
     )
 
-    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str):
-        super().__init__(title=f"ポイント入力: {str(tracking_key)[:40]}")
+    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str, display_name: str = None):
+        display = display_name or str(tracking_key)
+        super().__init__(title=f"ポイント入力: {display[:40]}")
         self.tracking_key = tracking_key
         self.spreadsheet_id = spreadsheet_id
         self.timestamp = timestamp
+        self.display_name = display
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -171,28 +179,31 @@ class PointInputModal(discord.ui.Modal):
                 {self.tracking_key: score},
             )
             await interaction.response.send_message(
-                f"✅ {self.tracking_key} のポイント {score:,} を記録しました。", ephemeral=True
+                f"✅ {self.display_name} のポイント {score:,} を記録しました。", ephemeral=True
             )
         except Exception as e:
             await interaction.response.send_message(f"記録に失敗しました: {e}", ephemeral=True)
 
 class PointInputButton(discord.ui.Button):
-    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str):
-        super().__init__(label=str(tracking_key)[:80], style=discord.ButtonStyle.primary)
+    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str, display_name: str = None):
+        display = display_name or str(tracking_key)
+        super().__init__(label=display[:80], style=discord.ButtonStyle.primary)
         self.tracking_key = tracking_key
         self.spreadsheet_id = spreadsheet_id
         self.timestamp = timestamp
+        self.display_name = display
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
-            PointInputModal(self.tracking_key, self.spreadsheet_id, self.timestamp)
+            PointInputModal(self.tracking_key, self.spreadsheet_id, self.timestamp, self.display_name)
         )
 
 class MissingUsersView(discord.ui.View):
-    def __init__(self, missing_keys: list, spreadsheet_id: str, timestamp: str):
+    def __init__(self, missing_keys: list, spreadsheet_id: str, timestamp: str, tracking_to_runner: dict = None):
         super().__init__(timeout=600)
         for key in missing_keys:
-            self.add_item(PointInputButton(key, spreadsheet_id, timestamp))
+            display = (tracking_to_runner or {}).get(key)
+            self.add_item(PointInputButton(key, spreadsheet_id, timestamp, display))
 
 @registry.every_hour_at_config("LogMinutes")
 async def ranking_logger(ctx: dict) -> str:
@@ -207,6 +218,8 @@ async def ranking_logger(ctx: dict) -> str:
         focus_raw = cfg.get("Focus") or []
         focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
 
+        tracking_to_runner = _tracking_to_runner(cfg)
+
         rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
         focus_scores = {k: v for k, v in all_scores.items() if k in focus_targets and v is not None}
 
@@ -214,7 +227,7 @@ async def ranking_logger(ctx: dict) -> str:
 
         missing = [t for t in trackings if t not in rankings]
         if missing and channel:
-            view = MissingUsersView(missing, cfg["SpreadsheetID"], last_time)
+            view = MissingUsersView(missing, cfg["SpreadsheetID"], last_time, tracking_to_runner)
             await channel.send(
                 "⚠️ 以下のユーザーのポイントが取得できませんでした。該当する方はボタンを押してポイントを入力してください。",
                 view=view,
@@ -234,13 +247,10 @@ async def ranking_logger(ctx: dict) -> str:
 
         player_scores = {k: v for k, v in rankings.items() if _is_player(k)}
 
-        runners_raw = cfg.get("Runners") or []
-        runners_list = runners_raw if isinstance(runners_raw, list) else ([runners_raw] if runners_raw else [])
-        tracking_to_runner = {t: runners_list[i] for i, t in enumerate(trackings) if i < len(runners_list)}
-
         lines = []
         for k, v in player_scores.items():
-            lines.append(f"{k}: {v:,} {hourly(k, v)}".rstrip())
+            display = tracking_to_runner.get(k, k)
+            lines.append(f"{display}: {v:,} {hourly(k, v)}".rstrip())
 
         if focus_scores:
             if lines:
@@ -295,8 +305,10 @@ async def auto_ranking_check(ctx: dict) -> str:
     if prev is None:
         return "AutoCheck(first)"
 
+    tracking_to_runner = _tracking_to_runner(cfg)
+
     stalled = [
-        f"{k}: {scores[k]:,}（前回 {prev[k]:,}）"
+        f"{tracking_to_runner.get(k, k)}: {scores[k]:,}（前回 {prev[k]:,}）"
         for k in scores
         if _is_player(k) and k in prev and scores[k] is not None and prev[k] is not None and scores[k] <= prev[k]
     ]

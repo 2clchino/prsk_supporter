@@ -75,33 +75,123 @@ _CHARA_ID_TO_NAME = {
     25: "MEIKO", 26: "KAITO",
 }
 
-def _get_leaderboard_sekai_run(chara_id: int = None) -> list:
-    card_title = _CHARA_ID_TO_NAME.get(chara_id) if chara_id else "Overall"
-    js = f"""() => {{
-        const title = {repr(card_title)};
-        const card = [...document.querySelectorAll('.card')].find(
-            c => c.querySelector('h3')?.innerText.trim() === title
-        );
-        if (!card) return [];
+_CHARA_ID_TO_NAME_JA = {
+    1: "一歌", 2: "咲希", 3: "穂波", 4: "志歩",
+    5: "みのり", 6: "遥", 7: "愛莉", 8: "雫",
+    9: "こはね", 10: "杏", 11: "冬弥", 12: "つかさ",
+    13: "司", 14: "えむ", 15: "寧々", 16: "類",
+    17: "奏", 18: "まふゆ", 19: "絵名", 20: "瑞希",
+    21: "ミク", 22: "リン", 23: "レン", 24: "ルカ",
+    25: "MEIKO", 26: "KAITO",
+}
+
+def _parse_sekai_ing_response(data: dict, chara_id: int = None) -> list:
+    """Parse /api/events/now/leaderboard JSON into the common entry format."""
+    if chara_id is None:
+        slots = data.get("slots") or data.get("rankings") or data.get("leaderboard") or []
+    else:
+        # Find chapter number by gameCharacterId
+        chapters = (data.get("event") or {}).get("chapters") or data.get("chapters") or []
+        chapter_no = next(
+            (c.get("chapterNo") or c.get("no") for c in chapters
+             if c.get("gameCharacterId") == chara_id),
+            None,
+        )
+        if chapter_no is not None:
+            slots = (data.get(f"chapter{chapter_no}")
+                     or data.get(f"slots_chapter{chapter_no}")
+                     or data.get("slots") or [])
+        else:
+            slots = data.get("slots") or []
+
+    result = []
+    for s in slots:
+        rank = s.get("rank")
+        name = s.get("name") or s.get("userName")
+        user_hash = s.get("hash") or s.get("userId") or s.get("id")
+        score_raw = s.get("score") or s.get("points")
+        try:
+            score = int(str(score_raw).replace(",", ""))
+        except (TypeError, ValueError):
+            score = None
+        if rank is not None and name:
+            result.append({"rank": rank, "score": score, "userName": name, "userId": user_hash})
+    return result
+
+
+def _get_leaderboard_sekai_ing(chara_id: int = None) -> list:
+    # Playwright: intercept XHR to get full response including hashes
+    char_name_ja = _CHARA_ID_TO_NAME_JA.get(chara_id) if chara_id else None
+    captured: dict = {}
+
+    def _on_response(response):
+        if "/api/events/now/leaderboard" in response.url and "data" not in captured:
+            try:
+                captured["data"] = response.json()
+            except Exception:
+                pass
+
+    extract_js = """(bodyId) => {
+        const tbody = document.querySelector('#' + bodyId);
+        if (!tbody) return [];
         const results = [];
-        for (const tr of card.querySelectorAll('tr:has(th.rank)')) {{
-            const rank = parseInt(tr.querySelector('th.rank').innerText.trim());
+        for (const tr of tbody.querySelectorAll('tr')) {
             const tds = tr.querySelectorAll('td');
-            const name = tds[1] ? tds[1].innerText.trim() : '';
-            const scoreRaw = tds[2] ? tds[2].innerText.trim() : '';
-            const score = parseInt(scoreRaw.replace(/,/g, ''));
-            if (!isNaN(rank) && name && !isNaN(score)) results.push({{rank, name, score}});
-        }}
+            if (tds.length < 3) continue;
+            let rankText = tds[0].innerText.trim();
+            if (!rankText) {
+                const el = tds[0].querySelector('[aria-label]');
+                rankText = el ? el.getAttribute('aria-label') : '';
+            }
+            const rank = parseInt(rankText.replace(/,/g, ''));
+            const nameEl = tds[1].querySelector('.username-label');
+            const name = nameEl ? nameEl.innerText.trim() : tds[1].innerText.trim();
+            const score = parseInt(tds[2].innerText.trim().replace(/,/g, ''));
+            if (!isNaN(rank) && name && !isNaN(score)) results.push({rank, name, score});
+        }
         return results;
-    }}"""
+    }"""
+
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.goto('https://sekai.run/', wait_until='domcontentloaded', timeout=30000)
-        page.wait_for_timeout(8000)
-        rankings = page.evaluate(js)
+        page.on("response", _on_response)
+        page.goto("https://sekai.ing/", wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.wait_for_selector("#eventTableOverallBody tr", timeout=15000)
+        except Exception:
+            page.wait_for_timeout(8000)
+
+        # If XHR was captured, parse it directly (includes hashes)
+        if captured.get("data"):
+            browser.close()
+            return _parse_sekai_ing_response(captured["data"], chara_id)
+
+        # Last resort: DOM scraping (hash unavailable)
+        body_id = "eventTableOverallBody"
+        if char_name_ja:
+            chapter_idx = page.evaluate(f"""() => {{
+                const charName = {repr(char_name_ja)};
+                for (const btn of document.querySelectorAll('button[data-bs-target]')) {{
+                    if (btn.innerText.trim() === charName) {{
+                        btn.click();
+                        const m = (btn.getAttribute('data-bs-target') || '').match(/chapter(\\d+)/i);
+                        return m ? m[1] : null;
+                    }}
+                }}
+                return null;
+            }}""")
+            if chapter_idx:
+                body_id = f"eventTableChapter{chapter_idx}Body"
+                try:
+                    page.wait_for_selector(f"#{body_id} tr", timeout=8000)
+                except Exception:
+                    page.wait_for_timeout(3000)
+
+        rankings = page.evaluate(extract_js, body_id)
         browser.close()
+
     return [
         {"rank": e["rank"], "score": e["score"], "userName": e["name"], "userId": None}
         for e in rankings
@@ -121,7 +211,7 @@ def get_event_rankings(event_id, ts):
     except Exception as e:
         print("Error:", e)
     try:
-        return _get_leaderboard_sekai_run(chara_id=None)
+        return _get_leaderboard_sekai_ing(chara_id=None)
     except Exception as e:
         print("Fallback Error:", e)
         return []
@@ -173,7 +263,7 @@ def get_chapter_rankings(event_id, chara_id, ts):
     except Exception as e:
         print("Error:", e)
     try:
-        return _get_leaderboard_sekai_run(chara_id=chara_id)
+        return _get_leaderboard_sekai_ing(chara_id=chara_id)
     except Exception as e:
         print("Fallback Error:", e)
         return []
