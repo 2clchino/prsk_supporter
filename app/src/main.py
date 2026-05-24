@@ -115,6 +115,12 @@ def _tracking_to_runner(cfg: dict) -> dict:
     runners_list = runners_raw if isinstance(runners_raw, list) else ([runners_raw] if runners_raw else [])
     return {t: runners_list[i] for i, t in enumerate(trackings) if i < len(runners_list)}
 
+def _event_ended(cfg: dict) -> bool:
+    try:
+        return now_jst() > ensure_aware_jst(cfg["EventEnd"])
+    except Exception:
+        return False
+
 def _is_player(t) -> bool:
     if isinstance(t, str):
         return True
@@ -150,6 +156,51 @@ async def _fetch_all_scores(cfg: dict) -> tuple[dict, str, bool]:
 _auto_prev_scores: dict[tuple, dict] = {}
 _logger_prev_scores: dict[tuple, dict] = {}
 
+def _format_ranking_lines(
+    cfg: dict, guild_id: int, spreadsheet_id: str,
+    all_scores: dict, used_fallback: bool, *, update_prev: bool = True,
+) -> str:
+    trackings = cfg.get("Trackings") or []
+    focus_raw = cfg.get("Focus") or []
+    focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
+    t2r = _tracking_to_runner(cfg)
+
+    rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
+    focus_scores = {k: v for k, v in all_scores.items() if k in focus_targets and v is not None}
+    player_scores = {k: v for k, v in rankings.items() if _is_player(k)}
+
+    log_interval = cfg.get("LogInterval", 30)
+    rate_mult = max(1, 60 // log_interval)
+    prev = _logger_prev_scores.get((guild_id, spreadsheet_id), {})
+
+    def hourly(k, v) -> str:
+        pv = prev.get(k)
+        if pv is None:
+            return ""
+        r = (v - pv) * rate_mult
+        sign = "+" if r >= 0 else ""
+        return f"（{sign}{r:,}/h）"
+
+    lines = []
+    for k, v in player_scores.items():
+        lines.append(f"{t2r.get(k, k)}: {v:,} {hourly(k, v)}".rstrip())
+
+    if focus_scores:
+        if lines:
+            lines.append("")
+        for fk, fv in focus_scores.items():
+            focus_line = f"{fk}: {fv:,} {hourly(fk, fv)}".rstrip()
+            for k, v in player_scores.items():
+                diff = v - fv
+                sign = "+" if diff >= 0 else ""
+                focus_line += f"\n   | {t2r.get(k, k)} {sign}{diff:,}"
+            lines.append(focus_line)
+
+    if update_prev:
+        _logger_prev_scores[(guild_id, spreadsheet_id)] = {**player_scores, **focus_scores}
+    suffix = " (fallback)" if used_fallback else ""
+    return "\n" + "\n".join(lines) + suffix if lines else f"api checked{suffix}"
+
 class PointInputModal(discord.ui.Modal):
     point = discord.ui.TextInput(
         label="現在のポイント",
@@ -157,13 +208,18 @@ class PointInputModal(discord.ui.Modal):
         max_length=20,
     )
 
-    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str, display_name: str = None):
+    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str,
+                 display_name: str = None, cfg: dict = None, guild_id: int = None,
+                 view_ref: "MissingUsersView" = None):
         display = display_name or str(tracking_key)
         super().__init__(title=f"ポイント入力: {display[:40]}")
         self.tracking_key = tracking_key
         self.spreadsheet_id = spreadsheet_id
         self.timestamp = timestamp
         self.display_name = display
+        self.cfg = cfg
+        self.guild_id = guild_id
+        self.view_ref = view_ref
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -171,6 +227,7 @@ class PointInputModal(discord.ui.Modal):
         except ValueError:
             await interaction.response.send_message("数値を入力してください。", ephemeral=True)
             return
+        await interaction.response.defer(ephemeral=True)
         try:
             await asyncio.to_thread(
                 ptlogger.write_values,
@@ -178,32 +235,89 @@ class PointInputModal(discord.ui.Modal):
                 self.timestamp,
                 {self.tracking_key: score},
             )
-            await interaction.response.send_message(
-                f"✅ {self.display_name} のポイント {score:,} を記録しました。", ephemeral=True
-            )
+            # update the shared view state and edit the channel message
+            if self.view_ref is not None:
+                await self.view_ref.on_score_submitted(self.tracking_key, score)
+                scores_for_display = self.view_ref.all_scores
+                fallback_for_display = self.view_ref.used_fallback
+            elif self.cfg and self.guild_id is not None:
+                try:
+                    scores_for_display, _, fallback_for_display = await _fetch_all_scores(self.cfg)
+                except Exception:
+                    scores_for_display, fallback_for_display = None, False
+            else:
+                scores_for_display, fallback_for_display = None, False
+
+            msg = f"✅ {self.display_name} のポイント {score:,} を記録しました。"
+            if scores_for_display is not None and self.cfg and self.guild_id is not None:
+                try:
+                    msg += _format_ranking_lines(
+                        self.cfg, self.guild_id, self.spreadsheet_id,
+                        scores_for_display, fallback_for_display, update_prev=False,
+                    )
+                except Exception:
+                    pass
+            await interaction.followup.send(msg, ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(f"記録に失敗しました: {e}", ephemeral=True)
+            try:
+                await interaction.followup.send(f"記録に失敗しました: {e}", ephemeral=True)
+            except Exception:
+                pass
 
 class PointInputButton(discord.ui.Button):
-    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str, display_name: str = None):
+    def __init__(self, tracking_key, spreadsheet_id: str, timestamp: str,
+                 display_name: str = None, cfg: dict = None, guild_id: int = None,
+                 view_ref: "MissingUsersView" = None):
         display = display_name or str(tracking_key)
         super().__init__(label=display[:80], style=discord.ButtonStyle.primary)
         self.tracking_key = tracking_key
         self.spreadsheet_id = spreadsheet_id
         self.timestamp = timestamp
         self.display_name = display
+        self.cfg = cfg
+        self.guild_id = guild_id
+        self.view_ref = view_ref
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
-            PointInputModal(self.tracking_key, self.spreadsheet_id, self.timestamp, self.display_name)
+            PointInputModal(self.tracking_key, self.spreadsheet_id, self.timestamp,
+                            self.display_name, self.cfg, self.guild_id, self.view_ref)
         )
 
 class MissingUsersView(discord.ui.View):
-    def __init__(self, missing_keys: list, spreadsheet_id: str, timestamp: str, tracking_to_runner: dict = None):
+    def __init__(self, missing_keys: list, spreadsheet_id: str, timestamp: str,
+                 tracking_to_runner: dict = None, cfg: dict = None, guild_id: int = None,
+                 all_scores: dict = None, used_fallback: bool = False):
         super().__init__(timeout=600)
+        self.cfg = cfg
+        self.guild_id = guild_id
+        self.spreadsheet_id = spreadsheet_id
+        self.all_scores = dict(all_scores or {})
+        self.used_fallback = used_fallback
+        self.pending_keys = set(missing_keys)
+        self.message = None
         for key in missing_keys:
             display = (tracking_to_runner or {}).get(key)
-            self.add_item(PointInputButton(key, spreadsheet_id, timestamp, display))
+            self.add_item(PointInputButton(key, spreadsheet_id, timestamp, display, cfg, guild_id, view_ref=self))
+
+    async def on_score_submitted(self, tracking_key, score: int) -> None:
+        self.all_scores[tracking_key] = score
+        self.pending_keys.discard(tracking_key)
+        for child in self.children:
+            if isinstance(child, PointInputButton) and child.tracking_key == tracking_key:
+                child.disabled = True
+                break
+        if self.message is None or self.cfg is None or self.guild_id is None:
+            return
+        try:
+            ranking_str = _format_ranking_lines(
+                self.cfg, self.guild_id, self.spreadsheet_id,
+                self.all_scores, self.used_fallback, update_prev=False,
+            )
+            header = "⚠️ 未入力あり" if self.pending_keys else "✅ 全員入力完了"
+            await self.message.edit(content=header + ranking_str, view=self)
+        except Exception:
+            pass
 
 @registry.every_hour_at_config("LogMinutes")
 async def ranking_logger(ctx: dict) -> str:
@@ -215,59 +329,24 @@ async def ranking_logger(ctx: dict) -> str:
         all_scores, last_time, used_fallback = await _fetch_all_scores(cfg)
 
         trackings = cfg.get("Trackings") or []
-        focus_raw = cfg.get("Focus") or []
-        focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
-
-        tracking_to_runner = _tracking_to_runner(cfg)
-
         rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
-        focus_scores = {k: v for k, v in all_scores.items() if k in focus_targets and v is not None}
 
         ptlogger.write_values(cfg["SpreadsheetID"], last_time, rankings)
 
         missing = [t for t in trackings if t not in rankings]
         if missing and channel:
-            view = MissingUsersView(missing, cfg["SpreadsheetID"], last_time, tracking_to_runner)
-            await channel.send(
+            view = MissingUsersView(
+                missing, cfg["SpreadsheetID"], last_time,
+                _tracking_to_runner(cfg), cfg, guild_id,
+                all_scores=all_scores, used_fallback=used_fallback,
+            )
+            sent = await channel.send(
                 "⚠️ 以下のユーザーのポイントが取得できませんでした。該当する方はボタンを押してポイントを入力してください。",
                 view=view,
             )
+            view.message = sent
 
-        log_interval = cfg.get("LogInterval", 30)
-        rate_mult = max(1, 60 // log_interval)
-        prev = _logger_prev_scores.get((guild_id, spreadsheet_id), {})
-
-        def hourly(k, v) -> str:
-            pv = prev.get(k)
-            if pv is None:
-                return ""
-            r = (v - pv) * rate_mult
-            sign = "+" if r >= 0 else ""
-            return f"（{sign}{r:,}/h）"
-
-        player_scores = {k: v for k, v in rankings.items() if _is_player(k)}
-
-        lines = []
-        for k, v in player_scores.items():
-            display = tracking_to_runner.get(k, k)
-            lines.append(f"{display}: {v:,} {hourly(k, v)}".rstrip())
-
-        if focus_scores:
-            if lines:
-                lines.append("")
-            for fk, fv in focus_scores.items():
-                focus_line = f"{fk}: {fv:,} {hourly(fk, fv)}".rstrip()
-                for k, v in player_scores.items():
-                    display = tracking_to_runner.get(k, k)
-                    diff = v - fv
-                    sign = "+" if diff >= 0 else ""
-                    focus_line += f"\n   | {display} {sign}{diff:,}"
-                lines.append(focus_line)
-
-        _logger_prev_scores[(guild_id, spreadsheet_id)] = {**player_scores, **focus_scores}
-
-        suffix = " (fallback)" if used_fallback else ""
-        return "\n" + "\n".join(lines) + suffix if lines else f"api checked{suffix}"
+        return _format_ranking_lines(cfg, guild_id, spreadsheet_id, all_scores, used_fallback)
 
     return await retry_async(
         _run_once,
@@ -342,6 +421,10 @@ async def on_ready():
     saved = storage.load_all_configs()
     print(f"Restoring {len(saved)} scheduler(s): {list(saved.keys())}")
     for (guild_id, spreadsheet_id), cfg in saved.items():
+        if _event_ended(cfg):
+            storage.delete_guild_config(guild_id, spreadsheet_id)
+            print(f"Removed ended event for guild {guild_id} / ss {spreadsheet_id}")
+            continue
         try:
             await scheduler.start_or_restart(guild_id, spreadsheet_id, cfg)
             print(f"Restored scheduler for guild {guild_id} / ss {spreadsheet_id}")
@@ -495,6 +578,15 @@ async def status(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
 
     blocks = []
+    for spreadsheet_id, config in list(all_configs.items()):
+        if _event_ended(config):
+            await scheduler.stop(guild_id, spreadsheet_id)
+            storage.delete_guild_config(guild_id, spreadsheet_id)
+            continue
+    all_configs = {k: v for k, v in all_configs.items() if not _event_ended(v)}
+    if not all_configs:
+        await interaction.followup.send("終了したイベントの設定を削除しました。現在有効な設定はありません。", ephemeral=True)
+        return
     multi = len(all_configs) > 1
     for spreadsheet_id, config in all_configs.items():
         is_wb = config.get("isWorldBloom")

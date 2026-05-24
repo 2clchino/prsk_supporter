@@ -157,7 +157,7 @@ def _get_leaderboard_sekai_ing(chara_id: int = None) -> list:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.on("response", _on_response)
-        page.goto("https://sekai.ing/", wait_until="domcontentloaded", timeout=30000)
+        page.goto("https://jp.sekai.ing/", wait_until="domcontentloaded", timeout=30000)
         try:
             page.wait_for_selector("#eventTableOverallBody tr", timeout=15000)
         except Exception:

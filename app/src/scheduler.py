@@ -159,6 +159,7 @@ class EventScheduler:
                 now = now_jst()
                 if now >= end:
                     await _safe_send(channel, f"イベント期間が終了しています（End: {end}）。定期処理は実行されません。")
+                    storage.delete_guild_config(guild_id, spreadsheet_id)
                     break
 
                 minutes = log_minutes
@@ -169,6 +170,7 @@ class EventScheduler:
 
                 if target > end:
                     await _safe_send(channel, f"いべおつ！定期処理を停止します。")
+                    storage.delete_guild_config(guild_id, spreadsheet_id)
                     break
 
                 await asyncio.sleep(max(0.0, (target - now_jst()).total_seconds()))
