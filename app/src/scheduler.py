@@ -120,11 +120,11 @@ class EventScheduler:
         return [ss_id for (gid, ss_id), job in self.jobs.items()
                 if gid == guild_id and not job.task.done()]
 
-    async def start_or_restart(self, guild_id: int, spreadsheet_id: str, cfg: dict) -> None:
+    async def start_or_restart(self, guild_id: int, spreadsheet_id: str, cfg: dict, on_event_start=None) -> None:
         key = (guild_id, spreadsheet_id)
         async with self._locks[key]:
             await self.stop(guild_id, spreadsheet_id)
-            loop_task = asyncio.create_task(self._event_loop(guild_id, spreadsheet_id, cfg))
+            loop_task = asyncio.create_task(self._event_loop(guild_id, spreadsheet_id, cfg, on_event_start))
             self.jobs[key] = ManagedJob(task=loop_task, guild_id=guild_id, spreadsheet_id=spreadsheet_id)
 
     async def stop(self, guild_id: int, spreadsheet_id: str = None) -> None:
@@ -140,7 +140,7 @@ class EventScheduler:
                     pass
             self.jobs.pop(key, None)
 
-    async def _event_loop(self, guild_id: int, spreadsheet_id: str, cfg: dict) -> None:
+    async def _event_loop(self, guild_id: int, spreadsheet_id: str, cfg: dict, on_event_start=None) -> None:
         channel_id = cfg.get("ChannelID")
         if not channel_id:
             return
@@ -153,6 +153,7 @@ class EventScheduler:
         start = ensure_aware_jst(cfg["EventStart"])
         end   = ensure_aware_jst(cfg["EventEnd"])
         log_minutes = _compute_log_minutes(cfg)
+        event_announced = now_jst() >= start
 
         while True:
             try:
@@ -180,15 +181,23 @@ class EventScheduler:
                     continue
 
                 if start <= target <= end:
-                    ctx = {"guild_id": guild_id, "spreadsheet_id": spreadsheet_id, "config": cfg, "now": target, "channel": channel}
-                    try:
-                        results = await self.registry.run_for_minute(minute, ctx)
-                    except Exception as e:
-                        await _safe_send(channel, f"⚠️ 毎時処理でエラー: {type(e).__name__}: {e}")
-                        continue
+                    if not event_announced:
+                        event_announced = True
+                        if on_event_start:
+                            try:
+                                await on_event_start(cfg, guild_id, channel)
+                            except Exception as e:
+                                await _safe_send(channel, f"⚠️ イベント開始通知でエラー: {type(e).__name__}: {e}")
+                    else:
+                        ctx = {"guild_id": guild_id, "spreadsheet_id": spreadsheet_id, "config": cfg, "now": target, "channel": channel}
+                        try:
+                            results = await self.registry.run_for_minute(minute, ctx)
+                        except Exception as e:
+                            await _safe_send(channel, f"⚠️ 毎時処理でエラー: {type(e).__name__}: {e}")
+                            continue
 
-                    summary = " / ".join([_shorten(str(r)) for r in results if r is not None]) or "OK"
-                    await _safe_send(channel, f"{target:%Y-%m-%d %H:%M} 定期処理完了: {summary}")
+                        summary = " / ".join([_shorten(str(r)) for r in results if r is not None]) or "OK"
+                        await _safe_send(channel, f"{target:%Y-%m-%d %H:%M} 定期処理完了: {summary}")
 
             except asyncio.CancelledError:
                 raise
