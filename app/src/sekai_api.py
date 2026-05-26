@@ -88,24 +88,23 @@ _CHARA_ID_TO_NAME_JA = {
 def _parse_sekai_ing_response(data: dict, chara_id: int = None) -> list:
     """Parse /api/events/now/leaderboard JSON into the common entry format."""
     if chara_id is None:
-        slots = data.get("slots") or data.get("rankings") or data.get("leaderboard") or []
+        entries = data.get("rankings") or []
     else:
-        # Find chapter number by gameCharacterId
-        chapters = (data.get("event") or {}).get("chapters") or data.get("chapters") or []
+        # Find chapter index by character_id in event.chapters
+        chapters = (data.get("event") or {}).get("chapters") or []
         chapter_no = next(
-            (c.get("chapterNo") or c.get("no") for c in chapters
-             if c.get("gameCharacterId") == chara_id),
+            (c.get("num") for c in chapters if c.get("character_id") == chara_id),
             None,
         )
         if chapter_no is not None:
-            slots = (data.get(f"chapter{chapter_no}")
-                     or data.get(f"slots_chapter{chapter_no}")
-                     or data.get("slots") or [])
+            chapter_list = data.get("chapter_rankings") or []
+            idx = chapter_no - 1
+            entries = chapter_list[idx] if idx < len(chapter_list) else []
         else:
-            slots = data.get("slots") or []
+            entries = []
 
     result = []
-    for s in slots:
+    for s in entries:
         rank = s.get("rank")
         name = s.get("name") or s.get("userName")
         user_hash = s.get("hash") or s.get("userId") or s.get("id")
@@ -120,53 +119,43 @@ def _parse_sekai_ing_response(data: dict, chara_id: int = None) -> list:
 
 
 def _get_leaderboard_sekai_ing(chara_id: int = None) -> list:
-    # Playwright: intercept XHR to get full response including hashes
-    char_name_ja = _CHARA_ID_TO_NAME_JA.get(chara_id) if chara_id else None
-    captured: dict = {}
-
-    def _on_response(response):
-        if "/api/events/now/leaderboard" in response.url and "data" not in captured:
-            try:
-                captured["data"] = response.json()
-            except Exception:
-                pass
-
+    # Playwright: wait for the XHR leaderboard response (includes user hashes)
     extract_js = """(bodyId) => {
         const tbody = document.querySelector('#' + bodyId);
         if (!tbody) return [];
         const results = [];
+        let rowIndex = 0;
         for (const tr of tbody.querySelectorAll('tr')) {
             const tds = tr.querySelectorAll('td');
             if (tds.length < 3) continue;
-            let rankText = tds[0].innerText.trim();
-            if (!rankText) {
-                const el = tds[0].querySelector('[aria-label]');
-                rankText = el ? el.getAttribute('aria-label') : '';
-            }
-            const rank = parseInt(rankText.replace(/,/g, ''));
+            rowIndex++;
             const nameEl = tds[1].querySelector('.username-label');
             const name = nameEl ? nameEl.innerText.trim() : tds[1].innerText.trim();
             const score = parseInt(tds[2].innerText.trim().replace(/,/g, ''));
-            if (!isNaN(rank) && name && !isNaN(score)) results.push({rank, name, score});
+            if (name && !isNaN(score)) results.push({rank: rowIndex, name, score});
         }
         return results;
     }"""
+
+    char_name_ja = _CHARA_ID_TO_NAME_JA.get(chara_id) if chara_id else None
 
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.on("response", _on_response)
-        page.goto("https://jp.sekai.ing/", wait_until="domcontentloaded", timeout=30000)
-        try:
-            page.wait_for_selector("#eventTableOverallBody tr", timeout=15000)
-        except Exception:
-            page.wait_for_timeout(8000)
 
-        # If XHR was captured, parse it directly (includes hashes)
-        if captured.get("data"):
+        # expect_response must wrap the navigation so it catches the deferred XHR
+        try:
+            with page.expect_response(
+                lambda r: "/api/events/now/leaderboard" in r.url,
+                timeout=25000,
+            ) as response_info:
+                page.goto("https://jp.seka.ing/", wait_until="domcontentloaded", timeout=30000)
+            data = response_info.value.json()
             browser.close()
-            return _parse_sekai_ing_response(captured["data"], chara_id)
+            return _parse_sekai_ing_response(data, chara_id)
+        except Exception:
+            pass
 
         # Last resort: DOM scraping (hash unavailable)
         body_id = "eventTableOverallBody"
@@ -176,7 +165,7 @@ def _get_leaderboard_sekai_ing(chara_id: int = None) -> list:
                 for (const btn of document.querySelectorAll('button[data-bs-target]')) {{
                     if (btn.innerText.trim() === charName) {{
                         btn.click();
-                        const m = (btn.getAttribute('data-bs-target') || '').match(/chapter(\\d+)/i);
+                        const m = (btn.getAttribute('data-bs-target') || '').match(/chapter[-]?(\\d+)/i);
                         return m ? m[1] : null;
                     }}
                 }}
@@ -207,7 +196,10 @@ def get_event_rankings(event_id, ts):
         resp.raise_for_status()
         payload = resp.json()
         data = payload.get("data")
-        return data.get("eventRankings")
+        rankings = data.get("eventRankings")
+        if not rankings:
+            raise ValueError("empty eventRankings")
+        return rankings
     except Exception as e:
         print("Error:", e)
     try:
@@ -259,7 +251,10 @@ def get_chapter_rankings(event_id, chara_id, ts):
         resp.raise_for_status()
         payload = resp.json()
         data = payload.get("data")
-        return data.get("eventRankings")
+        rankings = data.get("eventRankings")
+        if not rankings:
+            raise ValueError("empty eventRankings")
+        return rankings
     except Exception as e:
         print("Error:", e)
     try:
@@ -295,6 +290,31 @@ def extract_scores(rankings: List[Dict[str, Any]],
                     result[t] = score_val
 
     return result
+
+def extract_ranks(rankings: List[Dict[str, Any]],
+                  targets: List[Union[int, str]]) -> Dict[Union[int, str], int]:
+    result: Dict[Union[int, str], int] = {}
+    def is_userid_like(x: Any) -> bool:
+        return isinstance(x, int) and len(str(abs(x))) >= 15
+    for entry in rankings:
+        rank_val = entry.get("rank")
+        user_name = entry.get("userName")
+        user_id = entry.get("userId")
+        user_id_str = str(user_id) if user_id is not None else None
+        for t in targets:
+            if t in result:
+                continue
+            if is_userid_like(t):
+                if user_id_str is not None and user_id_str == str(t):
+                    result[t] = rank_val
+            elif isinstance(t, int):
+                if rank_val == t:
+                    result[t] = rank_val
+            elif isinstance(t, str):
+                if user_name == t:
+                    result[t] = rank_val
+    return result
+
 def pick_hourly(times: List[str]) -> List[str]:
     dt_list = [datetime.fromisoformat(t.replace("Z", "+00:00")) for t in times]
     dt_list.sort()

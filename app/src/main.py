@@ -126,20 +126,32 @@ def _is_player(t) -> bool:
         return True
     return isinstance(t, int) and len(str(abs(t))) >= 15
 
-async def _fetch_all_scores(cfg: dict) -> tuple[dict, str, bool]:
+_STALE_THRESHOLD_MINUTES = 90
+
+async def _fetch_all_scores(cfg: dict) -> tuple[dict, dict, str, bool]:
     if cfg.get("isWorldBloom"):
         times = sekai_api.get_chapter_time(cfg["EventID"], cfg["CharaID"])
     else:
         times = sekai_api.get_event_time(cfg["EventID"])
 
+    raw = None
+    last_time = None
+    used_fallback = False
+
     if times:
-        last_time = times[-1]
-        if cfg.get("isWorldBloom"):
-            raw = sekai_api.get_chapter_rankings(cfg["EventID"], cfg["CharaID"], last_time)
+        candidate = times[-1]
+        age_minutes = (now_jst() - ensure_aware_jst(candidate)).total_seconds() / 60
+        if age_minutes <= _STALE_THRESHOLD_MINUTES:
+            if cfg.get("isWorldBloom"):
+                raw = sekai_api.get_chapter_rankings(cfg["EventID"], cfg["CharaID"], candidate)
+            else:
+                raw = sekai_api.get_event_rankings(cfg["EventID"], candidate)
+            if raw:
+                last_time = candidate
         else:
-            raw = sekai_api.get_event_rankings(cfg["EventID"], last_time)
-        used_fallback = False
-    else:
+            print(f"[INFO] api.sekai.best data is stale ({age_minutes:.0f} min old), falling back to seka.ing")
+
+    if not raw:
         chara_id = cfg.get("CharaID") if cfg.get("isWorldBloom") else None
         raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_ing, chara_id)
         if not raw:
@@ -151,7 +163,9 @@ async def _fetch_all_scores(cfg: dict) -> tuple[dict, str, bool]:
     focus_raw = cfg.get("Focus") or []
     focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
     all_targets = trackings + [f for f in focus_targets if f not in trackings]
-    return sekai_api.extract_scores(raw, all_targets), last_time, used_fallback
+    scores = sekai_api.extract_scores(raw, all_targets)
+    ranks = sekai_api.extract_ranks(raw, all_targets)
+    return scores, ranks, last_time, used_fallback
 
 _auto_prev_scores: dict[tuple, dict] = {}
 _logger_prev_scores: dict[tuple, dict] = {}
@@ -161,6 +175,7 @@ def _format_ranking_lines(
     all_scores: dict, used_fallback: bool, *,
     update_prev: bool = True,
     prev_override: dict = None,
+    all_ranks: dict = None,
 ) -> str:
     trackings = cfg.get("Trackings") or []
     focus_raw = cfg.get("Focus") or []
@@ -185,7 +200,9 @@ def _format_ranking_lines(
 
     lines = []
     for k, v in player_scores.items():
-        lines.append(f"{t2r.get(k, k)}: {v:,} {hourly(k, v)}".rstrip())
+        rank = all_ranks.get(k) if all_ranks else None
+        rank_prefix = f"[{rank}位] " if rank is not None else ""
+        lines.append(f"{rank_prefix}{t2r.get(k, k)}: {v:,} {hourly(k, v)}".rstrip())
 
     if focus_scores:
         if lines:
@@ -320,7 +337,7 @@ async def ranking_logger(ctx: dict) -> str:
     spreadsheet_id = ctx["spreadsheet_id"]
     channel = ctx.get("channel")
     async def _run_once():
-        all_scores, last_time, used_fallback = await _fetch_all_scores(cfg)
+        all_scores, all_ranks, last_time, used_fallback = await _fetch_all_scores(cfg)
 
         trackings = cfg.get("Trackings") or []
         rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
@@ -340,7 +357,7 @@ async def ranking_logger(ctx: dict) -> str:
             )
             view.message = sent
 
-        return _format_ranking_lines(cfg, guild_id, spreadsheet_id, all_scores, used_fallback)
+        return _format_ranking_lines(cfg, guild_id, spreadsheet_id, all_scores, used_fallback, all_ranks=all_ranks)
 
     try:
         return await retry_async(
@@ -383,7 +400,7 @@ async def auto_ranking_check(ctx: dict) -> str:
         return "AutoCheck(skip)"
 
     async def _run_once():
-        scores, _, _ = await _fetch_all_scores(cfg)
+        scores, _, _, _ = await _fetch_all_scores(cfg)
         return scores
 
     scores = await retry_async(

@@ -151,5 +151,5 @@ def write_values(spreadsheet_id: str,
             data_requests.append({"range": a1, "values": [[values_by_header[key_str if key_str in values_by_header else int(key_str)]]]} )
 
     if not data_requests:
-        raise ValueError(f"{target_day_str} の最適行 {best_row} は全対象カラムが既に埋まっています。")
+        return  # all columns already written for this row
     ws.batch_update(data_requests)
