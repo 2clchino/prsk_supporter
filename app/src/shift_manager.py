@@ -201,9 +201,13 @@ def is_auto_period(
         next_date_col = date_cols[i + 1] if i + 1 < len(date_cols) else len(data[0])
         for r in range(1, len(data)):
             tstr = data[r][date_col].strip() if date_col < len(data[r]) else ""
-            if not TIME_RE.match(tstr):
+            if TIME_RE.match(tstr):
+                row_hour = int(tstr.split(":")[0])
+            elif r <= 24:
+                row_hour = r - 1
+            else:
                 continue
-            if int(tstr.split(":")[0]) != dt.hour:
+            if row_hour != dt.hour:
                 continue
             for c in range(date_col + 1, next_date_col):
                 if c < len(data[r]) and data[r][c].strip().lower() == "auto":

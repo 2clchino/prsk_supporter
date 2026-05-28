@@ -56,9 +56,7 @@ async def shift_change(ctx: dict) -> str:
         names = ", ".join(item.get("shifters", [])) or "（割当なし）"
         lines.append(f"{i}. {ts} — {names}")
 
-    msg = f"**ChangeNotice** — {cfg.get('EventName')}\n" + "\n".join(lines)
-    await channel.send(msg)
-    return "ChangeNotice"
+    return None
 
 @registry.every_hour_at_config("NextServer")
 async def check_next_server(ctx: dict) -> str:
@@ -88,9 +86,7 @@ async def check_next_server(ctx: dict) -> str:
         names = ", ".join(item.get("shifters", [])) or "（割当なし）"
         lines.append(f"{i}. {ts} — {names}")
 
-    msg = f"**NextServer** — {cfg.get('EventName')}\n" + "\n".join(lines)
-    await channel.send(msg)
-    return "NextServer"
+    return None
 
 def _exp_backoff(attempt: int, base: float = 2.0, cap: float = 15.0, jitter: float = 0.25) -> float:
     d = min(cap, base * (2 ** (attempt - 1)))
@@ -126,7 +122,7 @@ def _is_player(t) -> bool:
         return True
     return isinstance(t, int) and len(str(abs(t))) >= 15
 
-_STALE_THRESHOLD_MINUTES = 90
+_STALE_THRESHOLD_MINUTES = 30
 
 async def _fetch_all_scores(cfg: dict) -> tuple[dict, dict, str, bool]:
     if cfg.get("isWorldBloom"):
@@ -286,11 +282,49 @@ class PointInputButton(discord.ui.Button):
                             self.display_name, self.cfg, self.guild_id, self.view_ref)
         )
 
+class RefreshValueModal(discord.ui.Modal, title="リフレ値ログ入力"):
+    value = discord.ui.TextInput(
+        label="リフレ値",
+        placeholder="例: 34.5",
+        max_length=30,
+        required=True,
+    )
+
+    def __init__(self, spreadsheet_id: str, timestamp: str):
+        super().__init__()
+        self.spreadsheet_id = spreadsheet_id
+        self.timestamp = timestamp
+
+    async def on_submit(self, interaction: discord.Interaction):
+        time_str = now_jst().strftime("%H:%M")
+        formatted = f"{self.value.value.strip()} ({time_str})"
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await asyncio.to_thread(
+                ptlogger.write_values,
+                self.spreadsheet_id,
+                self.timestamp,
+                {"リフレ値ログ": formatted},
+                overwrite=True,
+            )
+            await interaction.followup.send(f"✅ リフレ値 {formatted} を記録しました。", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"記録に失敗しました: {e}", ephemeral=True)
+
+class RefreshValueButton(discord.ui.Button):
+    def __init__(self, spreadsheet_id: str, timestamp: str):
+        super().__init__(label="リフレ値ログを入力", style=discord.ButtonStyle.secondary)
+        self.spreadsheet_id = spreadsheet_id
+        self.timestamp = timestamp
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(RefreshValueModal(self.spreadsheet_id, self.timestamp))
+
 class MissingUsersView(discord.ui.View):
     def __init__(self, missing_keys: list, spreadsheet_id: str, timestamp: str,
                  tracking_to_runner: dict = None, cfg: dict = None, guild_id: int = None,
-                 all_scores: dict = None, used_fallback: bool = False):
-        super().__init__(timeout=600)
+                 all_scores: dict = None, used_fallback: bool = False, timeout: float = 600):
+        super().__init__(timeout=timeout)
         self.cfg = cfg
         self.guild_id = guild_id
         self.spreadsheet_id = spreadsheet_id
@@ -331,18 +365,20 @@ class MissingUsersView(discord.ui.View):
             _logger_prev_scores.setdefault((self.guild_id, self.spreadsheet_id), {})[tracking_key] = score
 
 @registry.every_hour_at_config("LogMinutes")
-async def ranking_logger(ctx: dict) -> str:
+async def ranking_logger(ctx: dict) -> None:
     cfg = ctx["config"]
     guild_id = ctx["guild_id"]
     spreadsheet_id = ctx["spreadsheet_id"]
     channel = ctx.get("channel")
+    target = ctx.get("now", now_jst())
+    view_timeout = cfg.get("LogInterval", 60) * 60
+
     async def _run_once():
         all_scores, all_ranks, last_time, used_fallback = await _fetch_all_scores(cfg)
 
         trackings = cfg.get("Trackings") or []
         rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
-
-        ptlogger.write_values(cfg["SpreadsheetID"], last_time, rankings)
+        await asyncio.to_thread(ptlogger.write_values, cfg["SpreadsheetID"], last_time, rankings)
 
         missing = [t for t in trackings if t not in rankings]
         if missing and channel:
@@ -350,24 +386,32 @@ async def ranking_logger(ctx: dict) -> str:
                 missing, cfg["SpreadsheetID"], last_time,
                 _tracking_to_runner(cfg), cfg, guild_id,
                 all_scores=all_scores, used_fallback=used_fallback,
+                timeout=view_timeout,
             )
-            sent = await channel.send(
-                "⚠️ 以下のユーザーのポイントが取得できませんでした。該当する方はボタンを押してポイントを入力してください。",
-                view=view,
+            initial_ranking = _format_ranking_lines(
+                cfg, guild_id, spreadsheet_id, all_scores, used_fallback,
+                update_prev=False, prev_override=view._prev_snapshot,
+                all_ranks=all_ranks,
             )
+            sent = await channel.send("⚠️ 未入力あり" + initial_ranking, view=view)
             view.message = sent
 
-        return _format_ranking_lines(cfg, guild_id, spreadsheet_id, all_scores, used_fallback, all_ranks=all_ranks)
+        ranking_str = _format_ranking_lines(
+            cfg, guild_id, spreadsheet_id, all_scores, used_fallback,
+            update_prev=True, all_ranks=all_ranks,
+        )
+        return ranking_str, last_time, cfg["SpreadsheetID"]
 
     try:
-        return await retry_async(
+        ranking_str, last_time, ss_id = await retry_async(
             _run_once,
             attempts=3,
             catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
         )
-    except Exception:
+    except Exception as e:
+        print(f"[ranking_logger ERROR] {type(e).__name__}: {e}")
         if not channel:
-            return "api_failed(no_channel)"
+            return None
         trackings = cfg.get("Trackings") or []
         focus_raw = cfg.get("Focus") or []
         focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
@@ -378,13 +422,26 @@ async def ranking_logger(ctx: dict) -> str:
             all_missing, cfg["SpreadsheetID"], last_time,
             _tracking_to_runner(cfg), cfg, guild_id,
             all_scores={}, used_fallback=True,
+            timeout=view_timeout,
         )
         sent = await channel.send(
             "⚠️ APIからデータを取得できませんでした。全員のポイントを手動で入力してください。",
             view=view,
         )
         view.message = sent
-        return "api_failed(manual_input_requested)"
+        return None
+
+    if channel:
+        raw_msg = f"{target:%Y-%m-%d %H:%M} 定期処理完了: {ranking_str}"
+        full_msg = raw_msg if len(raw_msg) <= 1990 else raw_msg[:1989] + "…"
+        try:
+            refresh_view = discord.ui.View(timeout=view_timeout)
+            refresh_view.add_item(RefreshValueButton(ss_id, last_time))
+            await channel.send(full_msg, view=refresh_view)
+        except Exception as e:
+            print(f"[ranking_logger] view send failed ({type(e).__name__}: {e}), retrying without view")
+            await _safe_send(channel, full_msg)
+    return None
 
 @registry.every_hour_at_config("AutoMinutes")
 async def auto_ranking_check(ctx: dict) -> str:
@@ -397,29 +454,49 @@ async def auto_ranking_check(ctx: dict) -> str:
         shift_manager.is_auto_period, cfg.get("SpreadsheetID"), now_jst()
     )
     if not in_auto:
-        return "AutoCheck(skip)"
+        return None
 
     async def _run_once():
         scores, _, _, _ = await _fetch_all_scores(cfg)
         return scores
 
-    scores = await retry_async(
-        _run_once,
-        attempts=3,
-        catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
-    )
+    log_prefix = f"[AutoCheck] guild={guild_id} {now_jst().strftime('%H:%M')}"
+
+    try:
+        scores = await retry_async(
+            _run_once,
+            attempts=3,
+            catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
+        )
+    except Exception as e:
+        print(f"{log_prefix}: データ取得失敗 ({type(e).__name__}: {e})")
+        return None
 
     key = (guild_id, spreadsheet_id)
     prev = _auto_prev_scores.get(key)
     _auto_prev_scores[key] = scores
 
-    if prev is None:
-        return "AutoCheck(first)"
+    t2r = _tracking_to_runner(cfg)
+    trackings = cfg.get("Trackings") or []
 
-    tracking_to_runner = _tracking_to_runner(cfg)
+    def _delta(k, v) -> str:
+        if prev is None or prev.get(k) is None:
+            return ""
+        d = v - prev[k]
+        return f"（{'+'if d>=0 else ''}{d:,}）"
+
+    log_lines = [
+        f"  {t2r.get(k, k)}: {scores[k]:,} {_delta(k, scores[k])}".rstrip()
+        for k in trackings
+        if _is_player(k) and scores.get(k) is not None
+    ]
+    print(f"{log_prefix}:\n" + "\n".join(log_lines) if log_lines else f"{log_prefix}: スコアなし")
+
+    if prev is None:
+        return None
 
     stalled = [
-        f"{tracking_to_runner.get(k, k)}: {scores[k]:,}（前回 {prev[k]:,}）"
+        f"{t2r.get(k, k)}: {scores[k]:,}（前回 {prev[k]:,}）"
         for k in scores
         if _is_player(k) and k in prev and scores[k] is not None and prev[k] is not None and scores[k] <= prev[k]
     ]
@@ -427,7 +504,7 @@ async def auto_ranking_check(ctx: dict) -> str:
         await channel.send(
             "⚠️ オート期間中にポイント増加が確認できませんでした。次のユーザは端末を確認してください:\n" + "\n".join(stalled)
         )
-    return "AutoCheck"
+    return None
 
 scheduler = EventScheduler(bot, registry)
 
@@ -506,9 +583,14 @@ async def setup(interaction: discord.Interaction, text: str):
     if event_name:
         if chapter_no > 0:
             event_id, _, _ = sekai_api.filter_event_info(sekai_api.get_event_info_by_name(event_name))
-            config["CharaID"], start, end = sekai_api.filter_chapter_info(
-                sekai_api.get_chapter_info(event_id, chapter_no)
-            )
+            chapter_info = sekai_api.get_chapter_info(event_id, chapter_no)
+            if chapter_info is None:
+                await interaction.followup.send(
+                    f"設定エラー: イベント「{event_name}」のチャプター {chapter_no} が worldBlooms.json に見つかりませんでした。",
+                    ephemeral=True,
+                )
+                return
+            config["CharaID"], start, end = sekai_api.filter_chapter_info(chapter_info)
             config["isWorldBloom"] = True
         else:
             event_id, start, end = sekai_api.filter_event_info(
@@ -549,13 +631,18 @@ async def setup(interaction: discord.Interaction, text: str):
                 return
 
         if chapter_no > 0:
-            config["CharaID"], start, end = sekai_api.filter_chapter_info(
-                sekai_api.get_chapter_info(event_id, chapter_no)
-            )
+            chapter_info = sekai_api.get_chapter_info(event_id, chapter_no)
+            if chapter_info is None:
+                await interaction.followup.send(
+                    f"設定エラー: EventID {event_id} のチャプター {chapter_no} が worldBlooms.json に見つかりませんでした。",
+                    ephemeral=True,
+                )
+                return
+            config["CharaID"], start, end = sekai_api.filter_chapter_info(chapter_info)
             config["isWorldBloom"] = True
         else:
             config["isWorldBloom"] = False
-        
+
     config["EventID"] = event_id
     config["EventStart"] = ensure_aware_jst(start).isoformat()
     config["EventEnd"]   = ensure_aware_jst(end).isoformat()

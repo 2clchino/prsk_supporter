@@ -153,6 +153,8 @@ class EventScheduler:
         start = ensure_aware_jst(cfg["EventStart"])
         end   = ensure_aware_jst(cfg["EventEnd"])
         log_minutes = _compute_log_minutes(cfg)
+        auto_minutes = _coerce_minutes(cfg.get("AutoMinutes"))
+        all_minutes = sorted(set(log_minutes + auto_minutes)) if auto_minutes else log_minutes
         event_announced = now_jst() >= start
 
         while True:
@@ -163,7 +165,7 @@ class EventScheduler:
                     storage.delete_guild_config(guild_id, spreadsheet_id)
                     break
 
-                minutes = log_minutes
+                minutes = all_minutes
 
                 base = start if now < start else now
                 candidates = [(m, first_tick_on_or_after(base, m)) for m in minutes]
@@ -196,8 +198,10 @@ class EventScheduler:
                             await _safe_send(channel, f"⚠️ 毎時処理でエラー: {type(e).__name__}: {e}")
                             continue
 
-                        summary = " / ".join([_shorten(str(r)) for r in results if r is not None]) or "OK"
-                        await _safe_send(channel, f"{target:%Y-%m-%d %H:%M} 定期処理完了: {summary}")
+                        non_null = [str(r) for r in results if r is not None]
+                        if non_null:
+                            summary = " / ".join(non_null)
+                            await _safe_send(channel, _shorten(f"{target:%Y-%m-%d %H:%M} 定期処理完了: {summary}", 1990))
 
             except asyncio.CancelledError:
                 raise

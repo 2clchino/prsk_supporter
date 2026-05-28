@@ -21,20 +21,20 @@ def format_pt_table(spreadsheet_id: str,
         t += timedelta(minutes=interval_minutes)
 
     n_rows = 1 + len(times)
-    n_cols = 2 + max(len(trackings), 0)
+    n_cols = 2 + max(len(trackings), 0) + 1  # +1 for リフレ値ログ
 
     existing = next((ws for ws in sh.worksheets() if ws.title == sheet_title), None)
     if existing is not None:
-        if existing.row_count == n_rows:
+        if existing.row_count == n_rows and existing.col_count >= n_cols:
             return
         sh.del_worksheet(existing)
 
     ws = gspread_manager.create_sheet(sh, sheet_title, n_rows, max(n_cols, 2))
 
-    header = ["日付", "時間"] + [str(x) for x in trackings]
+    header = ["日付", "時間"] + [str(x) for x in trackings] + ["リフレ値ログ"]
     ws.update(values=[header], range_name=f"A1:{_col_letter(len(header))}1")
 
-    zero_row = [0] * len(header)
+    zero_row = [0] * (len(header) - 1) + [""]  # リフレ値ログ列は空欄
     ws.update(values=[zero_row], range_name=f"A2:{_col_letter(len(header))}2")
 
     day_hour_rows = []
@@ -62,7 +62,8 @@ def write_values(spreadsheet_id: str,
                  iso_timestamp: str,
                  values_by_header: Dict[Union[int, str], Any],
                  tz_name: str = "Asia/Tokyo",
-                 sheet_title: str = "PtLogs") -> None:
+                 sheet_title: str = "PtLogs",
+                 overwrite: bool = False) -> None:
     ts = iso_timestamp.strip()
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
@@ -146,7 +147,7 @@ def write_values(spreadsheet_id: str,
     current_vals = ws.batch_get(ranges)
     for i, a1 in enumerate(ranges):
         cur = current_vals[i][0] if (i < len(current_vals) and current_vals[i]) else ""
-        if not str(cur).strip():
+        if overwrite or not str(cur).strip():
             key_str = idx_to_key[i]
             data_requests.append({"range": a1, "values": [[values_by_header[key_str if key_str in values_by_header else int(key_str)]]]} )
 
