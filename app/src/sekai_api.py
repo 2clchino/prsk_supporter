@@ -1,23 +1,43 @@
 import requests
+import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Union
+from typing import List, Dict, Any, Union, Optional
 
 BASE_URL = "https://api.sekai.best"
 REGION = "jp"
-EVENTS_JSON_URL = (
-    "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff/"
-    "main/events.json"
-)
-WORLD_BLOOM_JSON_URL = (
-    "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff/"
-    "main/worldBlooms.json"
-)
+
+_GH_BASE = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff/main/"
+_CDN_BASE = "https://cdn.jsdelivr.net/gh/Sekai-World/sekai-master-db-diff@main/"
+
+def _gh_urls(filename: str) -> list[str]:
+    return [_GH_BASE + filename, _CDN_BASE + filename]
+
 JST = timezone(timedelta(hours=9))
 
+_cache: dict[str, tuple[float, Any]] = {}
+_CACHE_TTL = 3600  # 1時間
+
+def _fetch_json_cached(filename: str) -> Any:
+    now = time.monotonic()
+    if filename in _cache:
+        ts, data = _cache[filename]
+        if now - ts < _CACHE_TTL:
+            return data
+
+    last_exc = None
+    for url in _gh_urls(filename):
+        try:
+            resp = requests.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            _cache[filename] = (now, data)
+            return data
+        except Exception as e:
+            last_exc = e
+    raise last_exc
+
 def fetch_event_list():
-    resp = requests.get(EVENTS_JSON_URL)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _fetch_json_cached("events.json")
     if not isinstance(data, list):
         raise ValueError("events.json の中身がリストではありません。")
     return data
@@ -209,11 +229,9 @@ def get_event_rankings(event_id, ts):
         return []
 
 def fetch_world_bloom():
-    resp = requests.get(WORLD_BLOOM_JSON_URL)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _fetch_json_cached("worldBlooms.json")
     if not isinstance(data, list):
-        raise ValueError("events.json の中身がリストではありません。")
+        raise ValueError("worldBlooms.json の中身がリストではありません。")
     return data
 
 def get_chapter_info(event_id, chapter_no):
@@ -263,6 +281,20 @@ def get_chapter_rankings(event_id, chara_id, ts):
         print("Fallback Error:", e)
         return []
 
+def _entry_user_id(entry: Dict[str, Any]) -> Optional[str]:
+    uid = entry.get("userId") or (entry.get("userProfile") or {}).get("userId")
+    return str(uid) if uid is not None else None
+
+def _entry_twitter_id(entry: Dict[str, Any]) -> Optional[str]:
+    tid = (entry.get("userProfile") or {}).get("twitterId")
+    return str(tid) if tid else None
+
+def is_twitter_target(t: Any) -> bool:
+    return isinstance(t, str) and t.startswith("twitterId:")
+
+def _twitter_id_of(t: str) -> str:
+    return t[len("twitterId:"):]
+
 def extract_scores(rankings: List[Dict[str, Any]],
                    targets: List[Union[int, str]]) -> Dict[Union[int, str], Any]:
     result: Dict[Union[int, str], Any] = {}
@@ -271,15 +303,18 @@ def extract_scores(rankings: List[Dict[str, Any]],
     for entry in rankings:
         rank_val = entry.get("rank")
         user_name = entry.get("userName")
-        user_id   = entry.get("userId")
-        user_id_str = str(user_id) if user_id is not None else None
+        user_id_str = _entry_user_id(entry)
+        twitter_id = _entry_twitter_id(entry)
         score_val = entry.get("score")
         try:
             score_val = int(score_val)
         except (TypeError, ValueError):
             score_val = None
         for t in targets:
-            if is_userid_like(t):
+            if is_twitter_target(t):
+                if twitter_id and twitter_id == _twitter_id_of(t):
+                    result[t] = score_val
+            elif is_userid_like(t):
                 if user_id_str is not None and user_id_str == str(t):
                     result[t] = score_val
             elif isinstance(t, int):
@@ -288,7 +323,6 @@ def extract_scores(rankings: List[Dict[str, Any]],
             elif isinstance(t, str):
                 if user_name == t:
                     result[t] = score_val
-
     return result
 
 def extract_ranks(rankings: List[Dict[str, Any]],
@@ -299,12 +333,15 @@ def extract_ranks(rankings: List[Dict[str, Any]],
     for entry in rankings:
         rank_val = entry.get("rank")
         user_name = entry.get("userName")
-        user_id = entry.get("userId")
-        user_id_str = str(user_id) if user_id is not None else None
+        user_id_str = _entry_user_id(entry)
+        twitter_id = _entry_twitter_id(entry)
         for t in targets:
             if t in result:
                 continue
-            if is_userid_like(t):
+            if is_twitter_target(t):
+                if twitter_id and twitter_id == _twitter_id_of(t):
+                    result[t] = rank_val
+            elif is_userid_like(t):
                 if user_id_str is not None and user_id_str == str(t):
                     result[t] = rank_val
             elif isinstance(t, int):
@@ -313,6 +350,20 @@ def extract_ranks(rankings: List[Dict[str, Any]],
             elif isinstance(t, str):
                 if user_name == t:
                     result[t] = rank_val
+    return result
+
+def resolve_display_names(rankings: List[Dict[str, Any]],
+                          targets: List[Union[int, str]]) -> Dict[str, str]:
+    """twitterId:xxx ターゲットを実際のユーザー名に解決する"""
+    result: Dict[str, str] = {}
+    twitter_targets = {_twitter_id_of(t): t for t in targets if is_twitter_target(t)}
+    if not twitter_targets:
+        return result
+    for entry in rankings:
+        tid = _entry_twitter_id(entry)
+        if tid and tid in twitter_targets:
+            key = twitter_targets[tid]
+            result[key] = entry.get("userName", key)
     return result
 
 def pick_hourly(times: List[str]) -> List[str]:

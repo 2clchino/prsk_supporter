@@ -5,6 +5,29 @@ from datetime import datetime, timedelta
 import re
 from typing import List, Dict, Any, Union, Optional, Tuple
 
+def _find_tracking_refs(sh, trackings: list, config_sheet: str = "Config") -> list:
+    """Config シートの Trackings 行から =Config!XX セル参照式を生成する。
+    各トラッキング値が別セルに入っている場合のみ参照式を返す。それ以外は空リスト。"""
+    try:
+        cws = sh.worksheet(config_sheet)
+        rows = cws.get_all_values()
+        for row_idx, row in enumerate(rows):
+            if not row or row[0].strip() != "Trackings":
+                continue
+            # 値が入っているセルを左から順に収集
+            refs = []
+            for col_idx in range(1, len(row)):
+                if row[col_idx].strip():
+                    refs.append(f"={config_sheet}!{_col_letter(col_idx + 1)}{row_idx + 1}")
+                else:
+                    break
+            # セル数がトラッキング数と一致する場合のみ採用（カンマ区切り1セルの場合は不一致になる）
+            if len(refs) == len(trackings):
+                return refs
+    except Exception:
+        pass
+    return []
+
 def format_pt_table(spreadsheet_id: str,
                     start: datetime,
                     end: datetime,
@@ -31,8 +54,11 @@ def format_pt_table(spreadsheet_id: str,
 
     ws = gspread_manager.create_sheet(sh, sheet_title, n_rows, max(n_cols, 2))
 
-    header = ["日付", "時間"] + [str(x) for x in trackings] + ["リフレ値ログ"]
-    ws.update(values=[header], range_name=f"A1:{_col_letter(len(header))}1")
+    tracking_refs = _find_tracking_refs(sh, trackings)
+    tracking_headers = tracking_refs if tracking_refs else [str(x) for x in trackings]
+    header = ["日付", "時間"] + tracking_headers + ["リフレ値ログ"]
+    ws.update(values=[header], range_name=f"A1:{_col_letter(len(header))}1",
+              value_input_option="USER_ENTERED")
 
     zero_row = [0] * (len(header) - 1) + [""]  # リフレ値ログ列は空欄
     ws.update(values=[zero_row], range_name=f"A2:{_col_letter(len(header))}2")

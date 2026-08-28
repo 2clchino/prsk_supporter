@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tzdata \
+    && apt-get install -y --no-install-recommends tzdata ffmpeg libopus0 \
     && pip install -r requirements.txt \
     && playwright install-deps chromium \
     && rm -rf /var/lib/apt/lists/*

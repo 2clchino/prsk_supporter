@@ -111,6 +111,12 @@ def _tracking_to_runner(cfg: dict) -> dict:
     runners_list = runners_raw if isinstance(runners_raw, list) else ([runners_raw] if runners_raw else [])
     return {t: runners_list[i] for i, t in enumerate(trackings) if i < len(runners_list)}
 
+def _tracking_to_discord_id(cfg: dict) -> dict:
+    trackings = cfg.get("Trackings") or []
+    ids_raw = cfg.get("DiscordIDs") or []
+    ids_list = ids_raw if isinstance(ids_raw, list) else ([ids_raw] if ids_raw else [])
+    return {t: str(ids_list[i]) for i, t in enumerate(trackings) if i < len(ids_list)}
+
 def _event_ended(cfg: dict) -> bool:
     try:
         return now_jst() > ensure_aware_jst(cfg["EventEnd"])
@@ -124,7 +130,7 @@ def _is_player(t) -> bool:
 
 _STALE_THRESHOLD_MINUTES = 30
 
-async def _fetch_all_scores(cfg: dict) -> tuple[dict, dict, str, bool]:
+async def _fetch_all_scores(cfg: dict) -> tuple[dict, dict, str, bool, dict]:
     if cfg.get("isWorldBloom"):
         times = sekai_api.get_chapter_time(cfg["EventID"], cfg["CharaID"])
     else:
@@ -161,10 +167,12 @@ async def _fetch_all_scores(cfg: dict) -> tuple[dict, dict, str, bool]:
     all_targets = trackings + [f for f in focus_targets if f not in trackings]
     scores = sekai_api.extract_scores(raw, all_targets)
     ranks = sekai_api.extract_ranks(raw, all_targets)
-    return scores, ranks, last_time, used_fallback
+    resolved_names = sekai_api.resolve_display_names(raw, all_targets)
+    return scores, ranks, last_time, used_fallback, resolved_names
 
 _auto_prev_scores: dict[tuple, dict] = {}
 _logger_prev_scores: dict[tuple, dict] = {}
+_logger_prev_deltas: dict[tuple, dict] = {}
 
 def _format_ranking_lines(
     cfg: dict, guild_id: int, spreadsheet_id: str,
@@ -172,6 +180,7 @@ def _format_ranking_lines(
     update_prev: bool = True,
     prev_override: dict = None,
     all_ranks: dict = None,
+    resolved_names: dict = None,
 ) -> str:
     trackings = cfg.get("Trackings") or []
     focus_raw = cfg.get("Focus") or []
@@ -184,36 +193,58 @@ def _format_ranking_lines(
 
     log_interval = cfg.get("LogInterval", 30)
     rate_mult = max(1, 60 // log_interval)
-    prev = prev_override if prev_override is not None else _logger_prev_scores.get((guild_id, spreadsheet_id), {})
+    key = (guild_id, spreadsheet_id)
+    prev = prev_override if prev_override is not None else _logger_prev_scores.get(key, {})
+    prev_deltas = _logger_prev_deltas.get(key, {})
 
-    def hourly(k, v) -> str:
+    def _fmt(n: int) -> str:
+        return f"+{n:,}" if n >= 0 else f"{n:,}"
+
+    def change_info(k, v) -> str:
         pv = prev.get(k)
         if pv is None:
             return ""
-        r = (v - pv) * rate_mult
-        sign = "+" if r >= 0 else ""
-        return f"（{sign}{r:,}/h）"
+        delta = v - pv
+        hourly_rate = delta * rate_mult
+        pd = prev_deltas.get(k)
+        dc_part = f" ({_fmt(delta - pd)})" if pd is not None else ""
+        return f"　{_fmt(delta)}{dc_part}　{hourly_rate:,}/h"
+
+    def _rank_of(k):
+        r = all_ranks.get(k) if all_ranks else None
+        return (r is None, r or 0)
+
+    sorted_players = sorted(player_scores.items(), key=lambda item: _rank_of(item[0]))
+
+    def _display(k) -> str:
+        if k in t2r:
+            return t2r[k]
+        if resolved_names and k in resolved_names:
+            return resolved_names[k]
+        return str(k)
 
     lines = []
-    for k, v in player_scores.items():
+    for k, v in sorted_players:
         rank = all_ranks.get(k) if all_ranks else None
         rank_prefix = f"[{rank}位] " if rank is not None else ""
-        lines.append(f"{rank_prefix}{t2r.get(k, k)}: {v:,} {hourly(k, v)}".rstrip())
+        lines.append(f"{rank_prefix}{_display(k)}: {v:,}{change_info(k, v)}")
 
     if focus_scores:
         if lines:
             lines.append("")
         for fk, fv in focus_scores.items():
-            focus_line = f"{fk}: {fv:,} {hourly(fk, fv)}".rstrip()
-            for k, v in player_scores.items():
+            focus_line = f"{fk}: {fv:,}{change_info(fk, fv)}"
+            for k, v in sorted_players:
                 diff = v - fv
-                sign = "+" if diff >= 0 else ""
-                focus_line += f"\n   | {t2r.get(k, k)} {sign}{diff:,}"
+                focus_line += f"\n   | {_display(k)} {_fmt(diff)}"
             lines.append(focus_line)
 
     if update_prev:
-        existing = _logger_prev_scores.get((guild_id, spreadsheet_id), {})
-        _logger_prev_scores[(guild_id, spreadsheet_id)] = {**existing, **player_scores, **focus_scores}
+        existing_scores = _logger_prev_scores.get(key, {})
+        new_deltas = {k: v - existing_scores[k] for k, v in {**player_scores, **focus_scores}.items() if k in existing_scores}
+        existing_deltas = _logger_prev_deltas.get(key, {})
+        _logger_prev_deltas[key] = {**existing_deltas, **new_deltas}
+        _logger_prev_scores[key] = {**existing_scores, **player_scores, **focus_scores}
     suffix = " (fallback)" if used_fallback else ""
     return "\n" + "\n".join(lines) + suffix if lines else f"api checked{suffix}"
 
@@ -323,20 +354,22 @@ class RefreshValueButton(discord.ui.Button):
 class MissingUsersView(discord.ui.View):
     def __init__(self, missing_keys: list, spreadsheet_id: str, timestamp: str,
                  tracking_to_runner: dict = None, cfg: dict = None, guild_id: int = None,
-                 all_scores: dict = None, used_fallback: bool = False, timeout: float = 600):
+                 all_scores: dict = None, used_fallback: bool = False,
+                 resolved_names: dict = None, timeout: float = 600):
         super().__init__(timeout=timeout)
         self.cfg = cfg
         self.guild_id = guild_id
         self.spreadsheet_id = spreadsheet_id
         self.all_scores = dict(all_scores or {})
         self.used_fallback = used_fallback
+        self.resolved_names = resolved_names or {}
         self.pending_keys = set(missing_keys)
         self.message = None
         # snapshot prev at creation time — before _format_ranking_lines(update_prev=True) runs
         key = (guild_id, spreadsheet_id) if guild_id is not None else None
         self._prev_snapshot = dict(_logger_prev_scores.get(key, {})) if key else {}
         for key_btn in missing_keys:
-            display = (tracking_to_runner or {}).get(key_btn)
+            display = (tracking_to_runner or {}).get(key_btn) or self.resolved_names.get(key_btn)
             self.add_item(PointInputButton(key_btn, spreadsheet_id, timestamp, display, cfg, guild_id, view_ref=self))
 
     async def on_score_submitted(self, tracking_key, score: int) -> None:
@@ -354,6 +387,7 @@ class MissingUsersView(discord.ui.View):
                     self.cfg, self.guild_id, self.spreadsheet_id,
                     self.all_scores, self.used_fallback,
                     update_prev=False, prev_override=self._prev_snapshot,
+                    resolved_names=self.resolved_names,
                 )
                 header = "⚠️ 未入力あり" if self.pending_keys else "✅ 全員入力完了"
                 await self.message.edit(content=header + ranking_str, view=self)
@@ -374,36 +408,37 @@ async def ranking_logger(ctx: dict) -> None:
     view_timeout = cfg.get("LogInterval", 60) * 60
 
     async def _run_once():
-        all_scores, all_ranks, last_time, used_fallback = await _fetch_all_scores(cfg)
+        all_scores, all_ranks, last_time, used_fallback, resolved_names = await _fetch_all_scores(cfg)
 
         trackings = cfg.get("Trackings") or []
         rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
         await asyncio.to_thread(ptlogger.write_values, cfg["SpreadsheetID"], last_time, rankings)
 
         missing = [t for t in trackings if t not in rankings]
+        has_missing = bool(missing)
         if missing and channel:
             view = MissingUsersView(
                 missing, cfg["SpreadsheetID"], last_time,
                 _tracking_to_runner(cfg), cfg, guild_id,
                 all_scores=all_scores, used_fallback=used_fallback,
-                timeout=view_timeout,
+                resolved_names=resolved_names, timeout=view_timeout,
             )
             initial_ranking = _format_ranking_lines(
                 cfg, guild_id, spreadsheet_id, all_scores, used_fallback,
                 update_prev=False, prev_override=view._prev_snapshot,
-                all_ranks=all_ranks,
+                all_ranks=all_ranks, resolved_names=resolved_names,
             )
             sent = await channel.send("⚠️ 未入力あり" + initial_ranking, view=view)
             view.message = sent
 
         ranking_str = _format_ranking_lines(
             cfg, guild_id, spreadsheet_id, all_scores, used_fallback,
-            update_prev=True, all_ranks=all_ranks,
+            update_prev=True, all_ranks=all_ranks, resolved_names=resolved_names,
         )
-        return ranking_str, last_time, cfg["SpreadsheetID"]
+        return ranking_str, last_time, cfg["SpreadsheetID"], has_missing
 
     try:
-        ranking_str, last_time, ss_id = await retry_async(
+        ranking_str, last_time, ss_id, has_missing = await retry_async(
             _run_once,
             attempts=3,
             catch=(ReadTimeout, Timeout, ReqConnError, RequestException, RuntimeError, IndexError),
@@ -432,15 +467,22 @@ async def ranking_logger(ctx: dict) -> None:
         return None
 
     if channel:
-        raw_msg = f"{target:%Y-%m-%d %H:%M} 定期処理完了: {ranking_str}"
-        full_msg = raw_msg if len(raw_msg) <= 1990 else raw_msg[:1989] + "…"
-        try:
-            refresh_view = discord.ui.View(timeout=view_timeout)
-            refresh_view.add_item(RefreshValueButton(ss_id, last_time))
-            await channel.send(full_msg, view=refresh_view)
-        except Exception as e:
-            print(f"[ranking_logger] view send failed ({type(e).__name__}: {e}), retrying without view")
-            await _safe_send(channel, full_msg)
+        refresh_view = discord.ui.View(timeout=view_timeout)
+        refresh_view.add_item(RefreshValueButton(ss_id, last_time))
+        if has_missing:
+            # 未入力ありメッセージ送信済みのため本文は省略、リフレ値ログボタンのみ
+            try:
+                await channel.send(f"{target:%Y-%m-%d %H:%M} リフレ値ログ:", view=refresh_view)
+            except Exception as e:
+                print(f"[ranking_logger] refresh button send failed ({type(e).__name__}: {e})")
+        else:
+            raw_msg = f"{target:%Y-%m-%d %H:%M} 定期処理完了: {ranking_str}"
+            full_msg = raw_msg if len(raw_msg) <= 1990 else raw_msg[:1989] + "…"
+            try:
+                await channel.send(full_msg, view=refresh_view)
+            except Exception as e:
+                print(f"[ranking_logger] view send failed ({type(e).__name__}: {e}), retrying without view")
+                await _safe_send(channel, full_msg)
     return None
 
 @registry.every_hour_at_config("AutoMinutes")
@@ -457,7 +499,7 @@ async def auto_ranking_check(ctx: dict) -> str:
         return None
 
     async def _run_once():
-        scores, _, _, _ = await _fetch_all_scores(cfg)
+        scores, _, _, _, _ = await _fetch_all_scores(cfg)
         return scores
 
     log_prefix = f"[AutoCheck] guild={guild_id} {now_jst().strftime('%H:%M')}"
@@ -477,6 +519,7 @@ async def auto_ranking_check(ctx: dict) -> str:
     _auto_prev_scores[key] = scores
 
     t2r = _tracking_to_runner(cfg)
+    t2did = _tracking_to_discord_id(cfg)
     trackings = cfg.get("Trackings") or []
 
     def _delta(k, v) -> str:
@@ -495,14 +538,16 @@ async def auto_ranking_check(ctx: dict) -> str:
     if prev is None:
         return None
 
-    stalled = [
-        f"{t2r.get(k, k)}: {scores[k]:,}（前回 {prev[k]:,}）"
-        for k in scores
+    stalled_keys = [
+        k for k in scores
         if _is_player(k) and k in prev and scores[k] is not None and prev[k] is not None and scores[k] <= prev[k]
     ]
-    if stalled and channel:
+    if stalled_keys and channel:
+        stalled_lines = [f"{t2r.get(k, k)}: {scores[k]:,}（前回 {prev[k]:,}）" for k in stalled_keys]
+        mentions = " ".join(f"<@{t2did[k]}>" for k in stalled_keys if k in t2did)
+        prefix = mentions + "\n" if mentions else ""
         await channel.send(
-            "⚠️ オート期間中にポイント増加が確認できませんでした。次のユーザは端末を確認してください:\n" + "\n".join(stalled)
+            prefix + "⚠️ オート期間中にポイント増加が確認できませんでした。次のユーザは端末を確認してください:\n" + "\n".join(stalled_lines)
         )
     return None
 
@@ -822,6 +867,102 @@ async def on_message(message: discord.Message):
     if intents.message_content and message.content.strip().lower() == "ping":
         await message.channel.send("Pong!")
     await bot.process_commands(message)
+
+# ---- Voice / Soundboard ----
+
+_SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
+
+def _ensure_test_tone():
+    path = os.path.join(_SOUNDS_DIR, "test_tone.wav")
+    if not os.path.exists(path):
+        import sys
+        sys.path.insert(0, _SOUNDS_DIR)
+        from generate_test_tone import generate
+        generate(path)
+    return path
+
+_ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus"}
+_MAX_AUDIO_SIZE = 8 * 1024 * 1024  # 8MB
+
+@bot.tree.command(name="play_sound", description="VCに入って音を鳴らす。ファイルを添付するとその音を再生。")
+@app_commands.describe(file="再生する音声ファイル（mp3/wav/ogg など）。省略するとテスト音を再生。")
+async def play_sound(interaction: discord.Interaction, file: discord.Attachment = None):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message("先にVCに入ってからコマンドを実行してください。", ephemeral=True)
+        return
+
+    vc_channel = interaction.user.voice.channel
+    await interaction.response.defer(ephemeral=True)
+
+    # 音声ファイルの準備
+    tmp_path = None
+    try:
+        if file is not None:
+            ext = os.path.splitext(file.filename)[1].lower()
+            if ext not in _ALLOWED_AUDIO_EXTENSIONS:
+                await interaction.followup.send(
+                    f"対応していない形式です。対応形式: {', '.join(_ALLOWED_AUDIO_EXTENSIONS)}", ephemeral=True
+                )
+                return
+            if file.size > _MAX_AUDIO_SIZE:
+                await interaction.followup.send("ファイルサイズが大きすぎます（上限 8MB）。", ephemeral=True)
+                return
+            tmp_path = os.path.join("/tmp", f"play_sound_{interaction.id}{ext}")
+            data = await file.read()
+            await asyncio.to_thread(lambda: open(tmp_path, "wb").write(data))
+            sound_path = tmp_path
+            print(f"[play_sound] 添付ファイル保存: {file.filename} → {tmp_path}")
+        else:
+            sound_path = await asyncio.to_thread(_ensure_test_tone)
+            print(f"[play_sound] テストトーン: {sound_path}")
+    except Exception as e:
+        print(f"[play_sound] ファイル準備失敗: {e}")
+        await interaction.followup.send(f"音声ファイルの準備に失敗しました: {e}", ephemeral=True)
+        return
+
+    vc: discord.VoiceClient = discord.utils.get(bot.voice_clients, guild=interaction.guild)
+    try:
+        if vc is None:
+            print("[play_sound] VCに接続中...")
+            vc = await asyncio.wait_for(vc_channel.connect(), timeout=15.0)
+            print("[play_sound] VC接続完了")
+        elif vc.channel != vc_channel:
+            print("[play_sound] VCを移動中...")
+            await asyncio.wait_for(vc.move_to(vc_channel), timeout=15.0)
+            print("[play_sound] VC移動完了")
+
+        if vc.is_playing():
+            vc.stop()
+
+        def after_play(err):
+            if err:
+                print(f"[play_sound] 再生エラー: {err}")
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
+
+        vc.play(
+            discord.FFmpegPCMAudio(sound_path, options="-af adelay=1500|1500"),
+            after=after_play,
+        )
+        label = file.filename if file else "テスト音"
+        print(f"[play_sound] 再生開始: {label}")
+        await interaction.followup.send(f"🔊 {vc_channel.name} で **{label}** を再生中...", ephemeral=True)
+
+    except asyncio.TimeoutError:
+        print("[play_sound] VC接続タイムアウト")
+        await interaction.followup.send("VCへの接続がタイムアウトしました。botにVCへの接続・発言権限があるか確認してください。", ephemeral=True)
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if vc and vc.is_connected():
+            await vc.disconnect()
+    except Exception as e:
+        print(f"[play_sound] エラー: {type(e).__name__}: {e}")
+        await interaction.followup.send(f"再生に失敗しました: {type(e).__name__}: {e}", ephemeral=True)
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if vc and vc.is_connected():
+            await vc.disconnect()
 
 if __name__ == "__main__":
     bot.run(TOKEN, log_handler=None)
