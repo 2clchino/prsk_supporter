@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-_STORE_PATH = Path("config_store.json")
+import os as _os
+_DATA_DIR = Path(_os.environ.get("DATA_DIR", "."))
+_STORE_PATH = _DATA_DIR / "config_store.json"
 
 def _read_all() -> Dict[str, Any]:
     if not _STORE_PATH.exists():

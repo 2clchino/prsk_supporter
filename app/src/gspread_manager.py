@@ -13,9 +13,14 @@ SCOPES = [
 SERVICE_ACCOUNT_KEY = "./keys/rock-perception-419201-eb5dbe72985b.json"
 load_dotenv(override=False)
 
+def _get_credentials() -> Credentials:
+    val = os.environ["SERVICE_ACCOUNT_KEY"]
+    if val.strip().startswith("{"):
+        return Credentials.from_service_account_info(json.loads(val), scopes=SCOPES)
+    return Credentials.from_service_account_file(val, scopes=SCOPES)
+
 def load_sheet(spreadsheet_id: str):
-    service_account_key = os.environ["SERVICE_ACCOUNT_KEY"]
-    creds = Credentials.from_service_account_file(service_account_key, scopes=SCOPES)
+    creds = _get_credentials()
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(spreadsheet_id)
     return sh
@@ -113,6 +118,49 @@ def _coerce_values(cells: List[str]) -> Any:
             return [_coerce_scalar(p) for p in splitted] if len(splitted) > 1 else _coerce_scalar(v)
         return _coerce_scalar(v)
     return [_coerce_scalar(v) for v in vals]
+
+def _col_letter(n: int) -> str:
+    result = []
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result.append(chr(ord('A') + r))
+    return ''.join(reversed(result)) or 'A'
+
+def create_spreadsheet(title: str, owner_email: str = None) -> tuple[str, str]:
+    creds = _get_credentials()
+    gc = gspread.authorize(creds)
+    sh = gc.create(title)
+    if owner_email:
+        # 指定メールに所有権を移譲（サービスアカウントはエディタとして残る）
+        sh.share(owner_email, perm_type='user', role='owner', transfer_ownership=True)
+    else:
+        # メール未指定はリンクを知る全員が編集可
+        sh.share('', perm_type='anyone', role='writer')
+    return sh.id, sh.url
+
+def write_config_values(spreadsheet_id: str, config: dict, sheet_name: str = "Config") -> None:
+    sh = load_sheet(spreadsheet_id)
+    try:
+        ws = sh.worksheet(sheet_name)
+        ws.clear()
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=sheet_name, rows=50, cols=20)
+
+    rows = []
+    for key, value in config.items():
+        if value is None:
+            continue
+        if isinstance(value, list):
+            rows.append([str(key)] + [str(v) for v in value])
+        else:
+            rows.append([str(key), str(value)])
+
+    if not rows:
+        return
+    max_cols = max(len(r) for r in rows)
+    for r in rows:
+        r += [""] * (max_cols - len(r))
+    ws.update(values=rows, range_name=f"A1:{_col_letter(max_cols)}{len(rows)}")
 
 def read_config_values(spreadsheet_id: str, sheet_name: str = "Config") -> Dict[str, Any]:
     ws = load_sheet(spreadsheet_id).worksheet(sheet_name)

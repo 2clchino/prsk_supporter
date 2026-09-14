@@ -210,3 +210,5 @@ ENV/
 
 # mkdocs documentation
 /site
+# AWS デプロイ設定（アカウントIDを含むため）
+task-definition.json

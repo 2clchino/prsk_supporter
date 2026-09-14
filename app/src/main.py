@@ -214,7 +214,7 @@ def _format_ranking_lines(
         r = all_ranks.get(k) if all_ranks else None
         return (r is None, r or 0)
 
-    sorted_players = sorted(player_scores.items(), key=lambda item: _rank_of(item[0]))
+    sorted_players = [(k, player_scores[k]) for k in trackings if k in player_scores]
 
     def _display(k) -> str:
         if k in t2r:
@@ -549,6 +549,14 @@ async def auto_ranking_check(ctx: dict) -> str:
         await channel.send(
             prefix + "⚠️ オート期間中にポイント増加が確認できませんでした。次のユーザは端末を確認してください:\n" + "\n".join(stalled_lines)
         )
+        alarm_channel_id = cfg.get("AlarmChannelID")
+        if alarm_channel_id:
+            guild = bot.get_guild(guild_id)
+            if guild:
+                raw_sound = cfg.get("AlarmSoundPath")
+                _default_alarm = os.path.join(_SOUNDS_DIR, "alarm_0.mp3")
+                sound_path = raw_sound if raw_sound and os.path.exists(raw_sound) else _default_alarm
+                asyncio.create_task(_play_alarm_in_vc(guild, alarm_channel_id, sound_path))
     return None
 
 scheduler = EventScheduler(bot, registry)
@@ -617,11 +625,8 @@ async def help_command(interaction: discord.Interaction):
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("PongPong!")
     
-@bot.tree.command(name="setup", description="スプレッドシートのセットアップ")
-@app_commands.describe(text="スプレッドシートID")
-async def setup(interaction: discord.Interaction, text: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    config = gspread_manager.read_config_values(text)
+async def _execute_setup(interaction: discord.Interaction, config: dict, spreadsheet_id: str, extra_msg: str = "") -> None:
+    """config と spreadsheet_id を受け取り、イベント情報解決 → スプシ整形 → スケジューラ起動を行う。"""
     event_name = (config.get("EventName") or "").strip()
     chapter_no = int(config.get("ChapterNo") or 0)
 
@@ -692,7 +697,7 @@ async def setup(interaction: discord.Interaction, text: str):
     config["EventStart"] = ensure_aware_jst(start).isoformat()
     config["EventEnd"]   = ensure_aware_jst(end).isoformat()
     config["ChannelID"] = int(interaction.channel_id)
-    config["SpreadsheetID"] = text
+    config["SpreadsheetID"] = spreadsheet_id
 
     log_interval = config.get("LogInterval", 60)
     try:
@@ -706,16 +711,15 @@ async def setup(interaction: discord.Interaction, text: str):
     config["AutoMinutes"] = list(range(0, 60, 5))
 
     guild_id = interaction.guild_id or 0
-    is_update = storage.load_guild_config(guild_id, text) is not None
+    is_update = storage.load_guild_config(guild_id, spreadsheet_id) is not None
     storage.save_guild_config(guild_id, config)
-    await scheduler.start_or_restart(guild_id, text, config, on_event_start=_on_event_start)
+    await scheduler.start_or_restart(guild_id, spreadsheet_id, config, on_event_start=_on_event_start)
     runners = config.get("Runners")
-    ptlogger.format_pt_table(text, start, end, config.get("Trackings"), interval_minutes=log_interval)
-    shift_manager.format_shift_table(text, ensure_aware_jst(start), ensure_aware_jst(end))
+    ptlogger.format_pt_table(spreadsheet_id, start, end, config.get("Trackings") or [], interval_minutes=log_interval)
+    shift_manager.format_shift_table(spreadsheet_id, ensure_aware_jst(start), ensure_aware_jst(end))
     runners_str = ", ".join(runners) if isinstance(runners, list) else (str(runners) if runners is not None else "未設定")
     is_wb = config.get("isWorldBloom")
     event_name_for_msg = config.get("EventName") or f"(ID: {event_id})"
-    change_min = int(config.get("ChangeNotice") or 0)
     log_minutes_str = ", ".join(f"{m:02d}" for m in config["LogMinutes"])
     chara_name = sekai_api._CHARA_ID_TO_NAME.get(config.get("CharaID"), str(config.get("CharaID"))) if is_wb else None
     prefix = "Updated: " if is_update else ""
@@ -728,8 +732,128 @@ async def setup(interaction: discord.Interaction, text: str):
         f"- 終了: {config['EventEnd']}\n"
         f"- ログ記録: {log_interval}分間隔（毎時 {log_minutes_str} 分）\n"
         f"- 投稿チャンネル: <#{config['ChannelID']}>"
+        + extra_msg
     )
     await interaction.followup.send(message, ephemeral=True)
+
+
+class ConfigFieldEditModal(discord.ui.Modal):
+    """特定の設定項目を1つだけ編集するモーダル。フィールドを動的に構成する。"""
+
+    def __init__(
+        self,
+        spreadsheet_id: str,
+        config: dict,
+        field_key: str,
+        field_label: str,
+        current_value: str,
+        guild_id: int,
+        style: discord.TextStyle = discord.TextStyle.short,
+        max_length: int = 500,
+    ):
+        super().__init__(title=f"{field_label}を編集")
+        self.spreadsheet_id = spreadsheet_id
+        self.config = config
+        self.field_key = field_key
+        self.guild_id = guild_id
+        self.text_input = discord.ui.TextInput(
+            label=field_label,
+            default=current_value,
+            style=style,
+            max_length=max_length,
+            required=False,
+        )
+        self.add_item(self.text_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        raw = self.text_input.value.strip()
+
+        if self.field_key == "Trackings":
+            parsed = [gspread_manager._coerce_scalar(t) for t in raw.split(",") if t.strip()]
+            self.config["Trackings"] = parsed
+        elif self.field_key == "Runners":
+            self.config["Runners"] = [r.strip() for r in raw.split(",") if r.strip()]
+        elif self.field_key == "LogInterval":
+            try:
+                val = int(raw)
+                if not (1 <= val <= 60):
+                    raise ValueError
+                self.config["LogInterval"] = val
+                self.config["LogMinutes"] = sorted(set((m + 1) % 60 for m in range(0, 60, val)))
+            except ValueError:
+                await interaction.followup.send("ログ間隔は 1〜60 の整数で指定してください。", ephemeral=True)
+                return
+        else:
+            self.config[self.field_key] = raw
+
+        storage.save_guild_config(self.guild_id, self.config)
+
+        try:
+            await asyncio.to_thread(gspread_manager.write_config_values, self.spreadsheet_id, self.config)
+        except Exception as e:
+            await interaction.followup.send(f"Config シートへの書き込みに失敗しました: {e}", ephemeral=True)
+            return
+
+        await scheduler.start_or_restart(self.guild_id, self.spreadsheet_id, self.config, on_event_start=_on_event_start)
+
+        if self.field_key == "Trackings":
+            try:
+                ev_start = ensure_aware_jst(self.config.get("EventStart"))
+                ev_end = ensure_aware_jst(self.config.get("EventEnd"))
+                await asyncio.to_thread(
+                    ptlogger.format_pt_table,
+                    self.spreadsheet_id, ev_start, ev_end,
+                    self.config.get("Trackings", []),
+                    interval_minutes=self.config.get("LogInterval", 60),
+                )
+            except Exception:
+                pass
+
+        await interaction.followup.send("✅ 設定を更新しました。", ephemeral=True)
+
+
+class StatusEditView(discord.ui.View):
+    """ステータス表示に付随する設定編集ボタン群。"""
+
+    def __init__(self, spreadsheet_id: str, config: dict, guild_id: int):
+        super().__init__(timeout=120)
+        trk = config.get("Trackings", [])
+        trk_str = ", ".join(str(t) for t in trk) if isinstance(trk, list) else (str(trk) if trk else "")
+        run = config.get("Runners", [])
+        run_str = ", ".join(str(r) for r in run) if isinstance(run, list) else (str(run) if run else "")
+
+        for label, key, field_label, cur_val, style, mlen in [
+            ("追跡対象", "Trackings", "追跡対象（カンマ区切り）", trk_str, discord.TextStyle.paragraph, 500),
+            ("ランナー", "Runners", "表示名（カンマ区切り）", run_str, discord.TextStyle.short, 200),
+            ("ログ間隔", "LogInterval", "ログ間隔（分・1〜60）", str(config.get("LogInterval", 60)), discord.TextStyle.short, 5),
+        ]:
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
+
+            def make_callback(ss_id, cfg, fk, fl, cv, st, ml):
+                async def callback(btn_interaction: discord.Interaction):
+                    await btn_interaction.response.send_modal(
+                        ConfigFieldEditModal(ss_id, dict(cfg), fk, fl, cv, guild_id, style=st, max_length=ml)
+                    )
+                return callback
+
+            btn.callback = make_callback(spreadsheet_id, config, key, field_label, cur_val, style, mlen)
+            self.add_item(btn)
+
+
+@bot.tree.command(name="setup", description="スプレッドシートから設定を読み込み、定期実行を開始します。")
+@app_commands.describe(text="スプレッドシートのID")
+async def setup(interaction: discord.Interaction, text: str = None):
+    if text is None:
+        await interaction.response.send_message(
+            "スプレッドシートIDを指定してください。例: `/setup <ID>`\n"
+            "設定の編集は `/status` のボタンから行えます。",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    config = gspread_manager.read_config_values(text)
+    await _execute_setup(interaction, config, text)
 
 async def _build_status_block(config: dict, status_str: str, *, ss_label: str = "") -> str:
     is_wb = config.get("isWorldBloom")
@@ -761,11 +885,15 @@ async def _build_status_block(config: dict, status_str: str, *, ss_label: str = 
     except Exception:
         auto_str = "取得失敗"
 
+    trk = config.get("Trackings", [])
+    trk_str = ", ".join(str(t) for t in trk) if isinstance(trk, list) else (str(trk) if trk else "未設定")
+
     header = f"{status_str}{' — ' + ss_label if ss_label else ''}"
     return (
         f"{header}\n"
         f"- イベント名: {event_name_for_msg}\n"
         f"- 種別: {f'WL {chara_name} チャプター' if is_wb else '通常イベント'}\n"
+        f"- 追跡対象: {trk_str}\n"
         f"- ランナー: {runners_str}\n"
         f"- 開始: {config.get('EventStart')}\n"
         f"- 終了: {config.get('EventEnd')}\n"
@@ -818,9 +946,11 @@ async def status(interaction: discord.Interaction):
 
         ss_label = f"`...{spreadsheet_id[-8:]}`" if multi else ""
         block = await _build_status_block(config, status_str, ss_label=ss_label)
-        blocks.append(block)
+        view = StatusEditView(spreadsheet_id, config, guild_id)
+        blocks.append((block, view))
 
-    await interaction.followup.send("\n\n".join(blocks), ephemeral=True)
+    for i, (block, view) in enumerate(blocks):
+        await interaction.followup.send(block, view=view, ephemeral=True)
 
 @bot.tree.command(name="clear_setup", description="保存済み設定を削除します（実行も停止）")
 @app_commands.describe(spreadsheet_id="削除するスプレッドシートID（省略すると全削除）")
@@ -871,6 +1001,7 @@ async def on_message(message: discord.Message):
 # ---- Voice / Soundboard ----
 
 _SOUNDS_DIR = os.path.join(os.path.dirname(__file__), "sounds")
+_ALARM_SOUNDS_DIR = os.path.join(os.environ.get("DATA_DIR", "/app"), "alarm_sounds")
 
 def _ensure_test_tone():
     path = os.path.join(_SOUNDS_DIR, "test_tone.wav")
@@ -963,6 +1094,107 @@ async def play_sound(interaction: discord.Interaction, file: discord.Attachment 
             os.remove(tmp_path)
         if vc and vc.is_connected():
             await vc.disconnect()
+
+
+async def _play_alarm_in_vc(guild: discord.Guild, channel_id: int, sound_path: str) -> None:
+    """指定チャンネルに入って sound_path を再生し、完了後に退出する。"""
+    vc_channel = guild.get_channel(channel_id)
+    if vc_channel is None:
+        print(f"[alarm] channel {channel_id} not found in guild {guild.id}")
+        return
+    vc: discord.VoiceClient = discord.utils.get(bot.voice_clients, guild=guild)
+    try:
+        if vc is None:
+            vc = await asyncio.wait_for(vc_channel.connect(), timeout=15.0)
+        elif vc.channel != vc_channel:
+            await asyncio.wait_for(vc.move_to(vc_channel), timeout=15.0)
+        if vc.is_playing():
+            vc.stop()
+
+        def after_alarm(err):
+            if err:
+                print(f"[alarm] 再生エラー: {err}")
+            asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
+
+        vc.play(
+            discord.FFmpegPCMAudio(sound_path, options="-af adelay=1500|1500"),
+            after=after_alarm,
+        )
+        print(f"[alarm] 再生開始: {vc_channel.name} / {sound_path}")
+    except Exception as e:
+        print(f"[alarm] エラー: {type(e).__name__}: {e}")
+        if vc and vc.is_connected():
+            await vc.disconnect()
+
+
+class AlarmSetView(discord.ui.View):
+    def __init__(self, vc_channel: discord.VoiceChannel, file: discord.Attachment | None, guild_id: int):
+        super().__init__(timeout=60)
+        self.vc_channel = vc_channel
+        self.file = file
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="このVCで設定する", style=discord.ButtonStyle.primary)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        sound_path = None
+        if self.file:
+            ext = os.path.splitext(self.file.filename)[1].lower()
+            if ext not in _ALLOWED_AUDIO_EXTENSIONS:
+                await interaction.followup.send(
+                    f"対応していない形式です。対応形式: {', '.join(_ALLOWED_AUDIO_EXTENSIONS)}", ephemeral=True
+                )
+                return
+            if self.file.size > _MAX_AUDIO_SIZE:
+                await interaction.followup.send("ファイルサイズが大きすぎます（上限 8MB）。", ephemeral=True)
+                return
+            os.makedirs(_ALARM_SOUNDS_DIR, exist_ok=True)
+            save_path = os.path.join(_ALARM_SOUNDS_DIR, f"alarm_{self.guild_id}{ext}")
+            data = await self.file.read()
+            await asyncio.to_thread(lambda: open(save_path, "wb").write(data))
+            sound_path = save_path
+
+        all_configs = storage.load_all_guild_configs(self.guild_id)
+        if not all_configs:
+            await interaction.followup.send(
+                "⚠️ 有効な設定がありません。先に `/setup` でセットアップを行ってください。", ephemeral=True
+            )
+            return
+        for ss_id, cfg in all_configs.items():
+            cfg["AlarmChannelID"] = self.vc_channel.id
+            cfg["AlarmSoundPath"] = sound_path  # None = デフォルト音
+            storage.save_guild_config(self.guild_id, cfg)
+            await scheduler.start_or_restart(self.guild_id, ss_id, cfg, on_event_start=_on_event_start)
+
+        sound_label = self.file.filename if self.file else "デフォルト音"
+        await interaction.followup.send(
+            f"🔔 アラームを設定しました。\n- VC: **{self.vc_channel.name}**\n- 音声: {sound_label}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="キャンセルしました。", view=None)
+
+
+@bot.tree.command(name="set_alarm", description="オート監視アラート時にVCでアラームを鳴らす設定をします。")
+@app_commands.describe(file="アラーム音声ファイル（省略するとデフォルト音）")
+async def set_alarm(interaction: discord.Interaction, file: discord.Attachment = None):
+    if not interaction.user.voice or not interaction.user.voice.channel:
+        await interaction.response.send_message(
+            "VCに入った状態でコマンドを実行してください。", ephemeral=True
+        )
+        return
+    vc_channel = interaction.user.voice.channel
+    guild_id = interaction.guild_id or 0
+    sound_label = f"（音声: {file.filename}）" if file else ""
+    await interaction.response.send_message(
+        f"🔔 **{vc_channel.name}** でアラームを設定します{sound_label}。よろしいですか？",
+        view=AlarmSetView(vc_channel, file, guild_id),
+        ephemeral=True,
+    )
+
 
 if __name__ == "__main__":
     bot.run(TOKEN, log_handler=None)

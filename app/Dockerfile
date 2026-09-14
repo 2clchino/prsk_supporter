@@ -19,3 +19,5 @@ RUN useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 
 RUN playwright install chromium
+
+CMD ["python", "-u", "src/main.py"]

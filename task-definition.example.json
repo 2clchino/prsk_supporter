@@ -1,0 +1,46 @@
+{
+  "family": "prsk-bot",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole-prsk",
+  "containerDefinitions": [{
+    "name": "discord-bot",
+    "image": "YOUR_ACCOUNT_ID.dkr.ecr.ap-northeast-1.amazonaws.com/prsk-supporter-bot:latest",
+    "essential": true,
+    "environment": [
+      { "name": "TZ", "value": "Asia/Tokyo" },
+      { "name": "DATA_DIR", "value": "/mnt/efs" }
+    ],
+    "secrets": [
+      {
+        "name": "DISCORD_TOKEN",
+        "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:YOUR_ACCOUNT_ID:secret:prsk-bot/discord-token"
+      },
+      {
+        "name": "SERVICE_ACCOUNT_KEY",
+        "valueFrom": "arn:aws:secretsmanager:ap-northeast-1:YOUR_ACCOUNT_ID:secret:prsk-bot/service-account-key"
+      }
+    ],
+    "mountPoints": [{
+      "sourceVolume": "efs-data",
+      "containerPath": "/mnt/efs",
+      "readOnly": false
+    }],
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "/ecs/prsk-bot",
+        "awslogs-region": "ap-northeast-1",
+        "awslogs-stream-prefix": "ecs"
+      }
+    }
+  }],
+  "volumes": [{
+    "name": "efs-data",
+    "efsVolumeConfiguration": {
+      "fileSystemId": "YOUR_EFS_ID"
+    }
+  }]
+}
