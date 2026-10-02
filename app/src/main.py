@@ -2,6 +2,7 @@ import os
 import logging
 import math
 import asyncio, random
+from datetime import timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Tuple
 import discord
@@ -243,6 +244,12 @@ async def _compute_refle_info(
     decay_amount = -(REFLE_DECAY_RATE_PER_30MIN * (interval_minutes / 30.0))
     t2r = _tracking_to_runner(cfg)
 
+    # Auto判定は「今回の区間(例: 1:30〜2:00)がどの時間帯に属するか」で行う必要がある。
+    # interval_end(時報の実行時刻、LogMinutesの+1補正で例えば2:01など)をそのまま使うと、
+    # 区間の大半が1時台であっても2時台のAuto設定を見てしまう。区間の中間時刻を使うことで
+    # 常にその区間が実際に属する時間帯(この例では1時台)のAuto設定を参照するようにする。
+    auto_check_time = interval_end - timedelta(minutes=interval_minutes / 2)
+
     info: dict = {}
     for k in trackings:
         if not _is_player(k):
@@ -254,7 +261,7 @@ async def _compute_refle_info(
         runner_name = t2r.get(k)
         try:
             is_auto = bool(runner_name) and await asyncio.to_thread(
-                shift_manager.is_auto_period, spreadsheet_id, interval_end, runner_name=runner_name,
+                shift_manager.is_auto_period, spreadsheet_id, auto_check_time, runner_name=runner_name,
             )
         except Exception as e:
             print(f"[refle_value] {k} のAuto判定に失敗: {type(e).__name__}: {e}")
@@ -275,9 +282,11 @@ async def _compute_refle_info(
 
         header_name = ptlogger.refle_value_header(k)
         try:
-            prior_cumulative = await asyncio.to_thread(ptlogger.get_cumulative_value, spreadsheet_id, header_name)
+            prior_cumulative = await asyncio.to_thread(ptlogger.get_latest_value, spreadsheet_id, header_name)
         except Exception as e:
-            print(f"[refle_value] {k} の累積値取得に失敗: {type(e).__name__}: {e}")
+            print(f"[refle_value] {k} の直前累積値取得に失敗: {type(e).__name__}: {e}")
+            prior_cumulative = None
+        if prior_cumulative is None:
             prior_cumulative = 0.0
 
         manual_note = None
@@ -296,30 +305,32 @@ async def _compute_refle_info(
                     "interval_minutes": interval_minutes,
                 }
                 new_cumulative = manual_value + count * fraction * REFLE_VALUE_RATE
-                increment = round(new_cumulative - prior_cumulative, 2)
             except Exception as e:
                 print(f"[refle_value] {k} の手動補正の解釈に失敗: {type(e).__name__}: {e}")
                 manual_note = None
-                increment = round(count * REFLE_VALUE_RATE, 2) if count > 0 else round(decay_amount, 2)
+                new_cumulative = prior_cumulative + (count * REFLE_VALUE_RATE if count > 0 else decay_amount)
         elif is_auto:
-            increment = round(decay_amount, 2)
+            new_cumulative = prior_cumulative + decay_amount
             decay_reason = "auto"
         elif count <= 0:
-            increment = round(decay_amount, 2)
+            new_cumulative = prior_cumulative + decay_amount
             decay_reason = "no_gain"
         else:
-            increment = round(count * REFLE_VALUE_RATE, 2)
+            new_cumulative = prior_cumulative + count * REFLE_VALUE_RATE
+
+        new_cumulative = round(new_cumulative, 2)
+        increment = round(new_cumulative - prior_cumulative, 2)
 
         cumulative = None
         try:
             await asyncio.to_thread(
-                ptlogger.write_values, spreadsheet_id, last_time, {header_name: increment}, overwrite=True,
+                ptlogger.write_values, spreadsheet_id, last_time, {header_name: new_cumulative}, overwrite=True,
             )
-            cumulative = await asyncio.to_thread(ptlogger.get_cumulative_value, spreadsheet_id, header_name)
+            cumulative = new_cumulative
             if manual_note is not None:
                 storage.clear_pending_refle(guild_id, spreadsheet_id, k)
         except Exception as e:
-            print(f"[refle_value] {k} の記録/集計に失敗: {type(e).__name__}: {e}")
+            print(f"[refle_value] {k} の記録に失敗: {type(e).__name__}: {e}")
 
         info[k] = {
             "count": count, "increment": increment, "cumulative": cumulative,
@@ -332,6 +343,7 @@ def _format_ranking_lines(
     all_scores: dict, used_fallback: bool, *,
     update_prev: bool = True,
     prev_override: dict = None,
+    prev_deltas_override: dict = None,
     all_ranks: dict = None,
     resolved_names: dict = None,
     refle_info: dict = None,
@@ -349,7 +361,7 @@ def _format_ranking_lines(
     rate_mult = max(1, 60 // log_interval)
     key = (guild_id, spreadsheet_id)
     prev = prev_override if prev_override is not None else _logger_prev_scores.get(key, {})
-    prev_deltas = _logger_prev_deltas.get(key, {})
+    prev_deltas = prev_deltas_override if prev_deltas_override is not None else _logger_prev_deltas.get(key, {})
 
     def _fmt(n: int) -> str:
         return f"+{n:,}" if n >= 0 else f"{n:,}"
@@ -384,9 +396,8 @@ def _format_ranking_lines(
                 effective_count = math.floor(entry["count"] * fraction)
                 base += (
                     f"\n　　↳ 手動入力({manual['time_str']}) {manual['value']:.2f}% を反映。"
-                    f" 以降{manual['remaining_minutes']}/{manual['interval_minutes']}分"
-                    f" (回数相当 {effective_count}回)のリフレ値を加算し"
-                    f" 累積を {cumulative:.2f}% に更新しました"
+                    f" 以降{manual['remaining_minutes']}分、"
+                    f" {effective_count}回のリフレ値を加算"
                 )
         return base
 
@@ -547,7 +558,8 @@ class MissingUsersView(discord.ui.View):
     def __init__(self, missing_keys: list, spreadsheet_id: str, timestamp: str,
                  tracking_to_runner: dict = None, cfg: dict = None, guild_id: int = None,
                  all_scores: dict = None, used_fallback: bool = False,
-                 resolved_names: dict = None, timeout: float = 600):
+                 resolved_names: dict = None, timeout: float = 600,
+                 prev_snapshot: dict = None, prev_deltas_snapshot: dict = None):
         super().__init__(timeout=timeout)
         self.cfg = cfg
         self.guild_id = guild_id
@@ -557,9 +569,16 @@ class MissingUsersView(discord.ui.View):
         self.resolved_names = resolved_names or {}
         self.pending_keys = set(missing_keys)
         self.message = None
-        # snapshot prev at creation time — before _format_ranking_lines(update_prev=True) runs
+        # snapshot prev at creation time — before _format_ranking_lines(update_prev=True) runs.
+        # 呼び出し元(ranking_logger)が PtLogs 書き込み前に解決した prev を渡す
+        # (Bot再起動でメモリが空でもシートから復元済みの値)。
         key = (guild_id, spreadsheet_id) if guild_id is not None else None
-        self._prev_snapshot = dict(_logger_prev_scores.get(key, {})) if key else {}
+        self._prev_snapshot = dict(prev_snapshot) if prev_snapshot is not None else (
+            dict(_logger_prev_scores.get(key, {})) if key else {}
+        )
+        self._prev_deltas_snapshot = dict(prev_deltas_snapshot) if prev_deltas_snapshot is not None else (
+            dict(_logger_prev_deltas.get(key, {})) if key else {}
+        )
         for key_btn in missing_keys:
             display = (tracking_to_runner or {}).get(key_btn) or self.resolved_names.get(key_btn)
             self.add_item(PointInputButton(key_btn, spreadsheet_id, timestamp, display, cfg, guild_id, view_ref=self))
@@ -579,6 +598,7 @@ class MissingUsersView(discord.ui.View):
                     self.cfg, self.guild_id, self.spreadsheet_id,
                     self.all_scores, self.used_fallback,
                     update_prev=False, prev_override=self._prev_snapshot,
+                    prev_deltas_override=self._prev_deltas_snapshot,
                     resolved_names=self.resolved_names,
                 )
                 header = "⚠️ 未入力あり" if self.pending_keys else "✅ 全員入力完了"
@@ -589,6 +609,38 @@ class MissingUsersView(discord.ui.View):
         self._prev_snapshot[tracking_key] = score
         if self.guild_id is not None:
             _logger_prev_scores.setdefault((self.guild_id, self.spreadsheet_id), {})[tracking_key] = score
+
+async def _resolve_prev_state(
+    spreadsheet_id: str, trackings: list, memory_prev: dict, memory_prev_deltas: dict,
+) -> tuple[dict, dict]:
+    """メモリ上(_logger_prev_scores/_logger_prev_deltas)に前回値・前回増分(加速度表示用)が
+    無いトラッキング対象について、PtLogs シートから一括で補完する。Bot再起動直後など
+    メモリが空の場合でも、シートに記録済みの値から復元できるようにするためのフォールバック。
+    トラッキング数が多い場合に1件ずつシートへアクセスするとAPIクォータに当たりやすいため、
+    不足分はまとめて1回のシート読み取り(get_recent_values_bulk)で取得する。
+    必ず、今回のスコアを PtLogs に書き込む前に呼び出すこと（書き込んだ後だと
+    「直前の値」が今回の値になってしまう）。"""
+    prev = dict(memory_prev)
+    prev_deltas = dict(memory_prev_deltas)
+    missing = [k for k in trackings if k not in prev or k not in prev_deltas]
+    if not missing:
+        return prev, prev_deltas
+
+    try:
+        bulk = await asyncio.to_thread(
+            ptlogger.get_recent_values_bulk, spreadsheet_id, [str(k) for k in missing], 2,
+        )
+    except Exception as e:
+        print(f"[prev_score] 前回値の一括取得に失敗: {type(e).__name__}: {e}")
+        bulk = {}
+
+    for k in missing:
+        values = bulk.get(str(k), [])
+        if k not in prev and values:
+            prev[k] = values[-1]
+        if k not in prev_deltas and len(values) == 2:
+            prev_deltas[k] = values[-1] - values[0]
+    return prev, prev_deltas
 
 @registry.every_hour_at_config("LogMinutes")
 async def ranking_logger(ctx: dict) -> None:
@@ -604,11 +656,19 @@ async def ranking_logger(ctx: dict) -> None:
 
         trackings = cfg.get("Trackings") or []
         rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
+
+        # 今回のスコアを PtLogs に書き込む前に、前回値・前々回値を解決する。
+        # メモリ(_logger_prev_scores等)に無ければシートから復元する(Bot再起動直後など)。
+        mem_key = (guild_id, spreadsheet_id)
+        prev_scores, prev_deltas = await _resolve_prev_state(
+            cfg["SpreadsheetID"], trackings,
+            _logger_prev_scores.get(mem_key, {}), _logger_prev_deltas.get(mem_key, {}),
+        )
+
         await asyncio.to_thread(ptlogger.write_values, cfg["SpreadsheetID"], last_time, rankings)
 
-        prev_scores_snapshot = dict(_logger_prev_scores.get((guild_id, spreadsheet_id), {}))
         refle_info = await _compute_refle_info(
-            cfg, guild_id, cfg["SpreadsheetID"], last_time, target, trackings, all_scores, prev_scores_snapshot,
+            cfg, guild_id, cfg["SpreadsheetID"], last_time, target, trackings, all_scores, prev_scores,
         )
 
         missing = [t for t in trackings if t not in rankings]
@@ -619,10 +679,11 @@ async def ranking_logger(ctx: dict) -> None:
                 _tracking_to_runner(cfg), cfg, guild_id,
                 all_scores=all_scores, used_fallback=used_fallback,
                 resolved_names=resolved_names, timeout=view_timeout,
+                prev_snapshot=prev_scores, prev_deltas_snapshot=prev_deltas,
             )
             initial_ranking = _format_ranking_lines(
                 cfg, guild_id, spreadsheet_id, all_scores, used_fallback,
-                update_prev=False, prev_override=view._prev_snapshot,
+                update_prev=False, prev_override=prev_scores, prev_deltas_override=prev_deltas,
                 all_ranks=all_ranks, resolved_names=resolved_names,
                 refle_info=refle_info,
             )
@@ -631,7 +692,8 @@ async def ranking_logger(ctx: dict) -> None:
 
         ranking_str = _format_ranking_lines(
             cfg, guild_id, spreadsheet_id, all_scores, used_fallback,
-            update_prev=True, all_ranks=all_ranks, resolved_names=resolved_names,
+            update_prev=True, prev_override=prev_scores, prev_deltas_override=prev_deltas,
+            all_ranks=all_ranks, resolved_names=resolved_names,
             refle_info=refle_info,
         )
         return ranking_str, last_time, cfg["SpreadsheetID"], has_missing
@@ -814,30 +876,41 @@ async def help_command(interaction: discord.Interaction):
         "　初回実行時に 'PtLogs' シートと 'Shift' シートを作成・フォーマットします。\n"
         "`/status` — 現在の設定とスケジューラの状態を表示します。\n"
         "`/clear_setup` — 設定を削除し、定期実行を停止します。\n"
+        "`/set_alarm` — Autoチェックのアラート時に、コマンド実行者がいるVCへBotが来てアラームを鳴らすよう設定します。\n"
+        "　（例: 寝る前に寝床VCへ移動してから実行する想定）\n"
         "\n"
         "__**スプレッドシート設定項目**__\n"
         "`EventName` — イベント名（部分一致）\n"
         "`ChapterNo` — WL チャプター番号（通常イベントは0または省略）\n"
         "`Trackings` — 記録するユーザー名または順位のリスト\n"
         "`Focus` — 差分を表示する順位\n"
-        "`Runners` — ランナーのリスト\n"
+        "`Runners` — ランナーのリスト（Trackingsと同じ順番）\n"
+        "`DiscordIDs` — ランナーのDiscord ID（Trackingsと同じ順番。Autoチェックの停滞通知でメンションします）\n"
         "`LogInterval` — ログ記録間隔（分）\n"
-        "`1Ebi` — 1回のプレイで得られる想定ポイント数。全員共通なら単一値、プレイヤーごとに異なる場合は\n"
-        "　Runners と同様に Trackings の順番に対応したリストで指定します。設定すると毎時報告で回数・リフレ値（回数×0.1998%、累積）を算出し、\n"
+        "`1Ebi` — 1回のプレイで得られる想定ポイント数。\n"
+        "　Runners と同様に Trackings の順番に対応したリストで指定。設定すると毎時報告で各プレイヤーの回数・リフレ値（回数×0.1998%、累積）を算出します。\n"
+        "　以下の時間帯は加算の代わりに30分あたり-8.33%減衰します:\n"
+        "　① Shift シートでそのランナーの列が Auto になっている時間帯\n　② ポイント増加が無かった時間帯\n"
         "　報告メッセージの「○○ リフレ値修正」ボタンからプレイヤーごとに現在値を手動補正できます\n"
-        "　（補正した時刻以降分の回数だけを補正値に加算し、次回の時報で累積値を更新します）。\n"
+        "　（補正した時刻以降分の回数を補正値に加算し、次回の時報で累積値を更新されるようになっています）。\n"
         "`ChangeNotice` — シフト通知を送る分（例: 55）\n"
+        "\n"
+        "__**Shift シート**__\n"
+        "日付×時間のマスに加え、Runners の人数分の専用列が自動作成され、デフォルトはRunner名で埋まっています。\n"
+        "該当する時間のセルを \"Auto\" に書き換えると、そのランナーはその時間帯Auto中として扱われます\n"
+        "（リフレ値の減衰・Autoチェックの判定の両方で、プレイヤーごとに使われます）。\n"
         "\n"
         "__**定期実行（設定後に自動で動作）**__\n"
         "`ランキングログ` — LogInterval 分ごとにランキングを取得し、スプレッドシートに記録・チャンネルに投稿します。\n"
         "`シフト通知` — ChangeNotice で指定した時刻に直近のシフトをチャンネルに投稿します。(現在機能していません)\n"
-        "`Autoチェック` — シフトシートで Auto と記入された時間帯に5分ごとポイント増加を監視します。\n"
+        "`Autoチェック` — Shift シートで Auto と記入された時間帯に5分ごとポイント増加を監視し、\n"
+        "　停滞していたら DiscordIDs のユーザーにメンションで通知します。\n"
     )
     await interaction.response.send_message(msg, ephemeral=False)
 
-@bot.tree.command(name="ping", description="動作確認用。'Ping-Pong!'の文字列を返却")
+@bot.tree.command(name="ping", description="動作確認用。'PingPong!'の文字列を返却")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("PongPong!")
+    await interaction.response.send_message("PingPong!")
     
 async def _execute_setup(interaction: discord.Interaction, config: dict, spreadsheet_id: str, extra_msg: str = "") -> None:
     """config と spreadsheet_id を受け取り、イベント情報解決 → スプシ整形 → スケジューラ起動を行う。"""
@@ -989,6 +1062,10 @@ class ConfigFieldEditModal(discord.ui.Modal):
             self.config["Trackings"] = parsed
         elif self.field_key == "Runners":
             self.config["Runners"] = [r.strip() for r in raw.split(",") if r.strip()]
+        elif self.field_key in ("Focus", "1Ebi"):
+            # 単一値(全員共通)とカンマ区切りリスト(Trackingsの順に対応、プレイヤーごと)の両方を許容する
+            parsed = [gspread_manager._coerce_scalar(t) for t in raw.split(",") if t.strip()]
+            self.config[self.field_key] = parsed[0] if len(parsed) == 1 else parsed
         elif self.field_key == "LogInterval":
             try:
                 val = int(raw)
@@ -1045,14 +1122,20 @@ class StatusEditView(discord.ui.View):
 
     def __init__(self, spreadsheet_id: str, config: dict, guild_id: int):
         super().__init__(timeout=120)
-        trk = config.get("Trackings", [])
-        trk_str = ", ".join(str(t) for t in trk) if isinstance(trk, list) else (str(trk) if trk else "")
-        run = config.get("Runners", [])
-        run_str = ", ".join(str(r) for r in run) if isinstance(run, list) else (str(run) if run else "")
+
+        def _str(val) -> str:
+            if isinstance(val, list):
+                return ", ".join(str(v) for v in val)
+            return str(val) if val not in (None, "") else ""
+
+        trk_str = _str(config.get("Trackings", []))
+        focus_str = _str(config.get("Focus"))
+        one_ebi_str = _str(config.get("1Ebi"))
 
         for label, key, field_label, cur_val, style, mlen in [
             ("追跡対象", "Trackings", "追跡対象（カンマ区切り）", trk_str, discord.TextStyle.paragraph, 500),
-            ("ランナー", "Runners", "表示名（カンマ区切り）", run_str, discord.TextStyle.short, 200),
+            ("フォーカス順位", "Focus", "差分表示対象（単一値 or カンマ区切り）", focus_str, discord.TextStyle.short, 200),
+            ("1エビPt", "1Ebi", "1回のポイント（単一値 or カンマ区切り）", one_ebi_str, discord.TextStyle.short, 200),
             ("ログ間隔", "LogInterval", "ログ間隔（分・1〜60）", str(config.get("LogInterval", 60)), discord.TextStyle.short, 5),
         ]:
             btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)

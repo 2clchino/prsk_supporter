@@ -242,20 +242,79 @@ def write_values(spreadsheet_id: str,
         return  # all columns already written for this row
     ws.batch_update(data_requests)
 
-def get_cumulative_value(spreadsheet_id: str,
-                         header_name: str,
-                         sheet_title: str = "PtLogs") -> float:
-    """指定した列の数値をすべて合算して返す（累積リフレ値の算出用）。"""
+def get_latest_value(spreadsheet_id: str,
+                     header_name: str,
+                     sheet_title: str = "PtLogs") -> Optional[float]:
+    """指定した列で、値が入っている最後の行の数値を返す。値が無い/列が無い場合は None。
+    （累積リフレ値は各行に累積値そのものを記録するため、直前の累積値はこの
+    「最後に値が入っている行」から取得する。前回スコアの復元にも使う。）"""
+    values = get_last_n_values(spreadsheet_id, header_name, 1, sheet_title=sheet_title)
+    return values[-1] if values else None
+
+def get_last_n_values(spreadsheet_id: str,
+                      header_name: str,
+                      n: int,
+                      sheet_title: str = "PtLogs") -> List[float]:
+    """指定した列から、値が入っている行を最大 n 件、古い→新しい順で返す。
+    Bot再起動でメモリ上の前回値を失った場合でも、シートから前回値・前々回値を
+    復元するために使う。"""
+    if n <= 0:
+        return []
     sh = gspread_manager.load_sheet(spreadsheet_id)
     ws = sh.worksheet(sheet_title)
     header = ws.row_values(1)
     if header_name not in header:
-        return 0.0
+        return []
     col = header.index(header_name) + 1
-    total = 0.0
-    for v in ws.col_values(col)[1:]:
+    result: List[float] = []
+    for v in reversed(ws.col_values(col)[1:]):
+        if v is None or str(v).strip() == "":
+            continue
         try:
-            total += float(v)
+            result.append(float(v))
         except (TypeError, ValueError):
             continue
-    return total
+        if len(result) >= n:
+            break
+    result.reverse()
+    return result
+
+def get_recent_values_bulk(spreadsheet_id: str,
+                           header_names: List[str],
+                           n: int = 2,
+                           sheet_title: str = "PtLogs") -> Dict[str, List[float]]:
+    """複数列について、直近 n 件の値(古い→新しい順)をまとめて取得する。
+    シート全体を1回読むだけで済むため、列数(トラッキング数)が多い場合でも
+    APIクォータを消費しにくい（Bot再起動直後に全トラッキング分の前回値を
+    復元する際など、列ごとに個別アクセスするとレート制限に当たりやすいため）。"""
+    result: Dict[str, List[float]] = {h: [] for h in header_names}
+    if n <= 0 or not header_names:
+        return result
+    sh = gspread_manager.load_sheet(spreadsheet_id)
+    ws = sh.worksheet(sheet_title)
+    all_values = ws.get_all_values()
+    if not all_values:
+        return result
+    header = all_values[0]
+    col_index = {h: i for i, h in enumerate(header) if h}
+    rows = all_values[1:]
+    for h in header_names:
+        idx = col_index.get(h)
+        if idx is None:
+            continue
+        vals: List[float] = []
+        for row in reversed(rows):
+            if idx >= len(row):
+                continue
+            cell = row[idx]
+            if cell is None or str(cell).strip() == "":
+                continue
+            try:
+                vals.append(float(cell))
+            except (TypeError, ValueError):
+                continue
+            if len(vals) >= n:
+                break
+        vals.reverse()
+        result[h] = vals
+    return result
