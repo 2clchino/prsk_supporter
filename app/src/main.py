@@ -381,12 +381,12 @@ def _format_ranking_lines(
             if cumulative is not None:
                 decay_reason = entry.get("decay_reason")
                 if decay_reason == "auto":
-                    detail = "Auto減衰"
+                    detail = "Autoにより"
                 elif decay_reason == "no_gain":
-                    detail = "増加なし"
+                    detail = "Pt増加なしにより"
                 else:
                     detail = f"{entry['count']}回"
-                base += f"　リフレ概算: {cumulative:.2f}% (増減{entry['increment']:+.2f}%, {detail})"
+                base += f"　リフレ概算: {cumulative:.2f}% ({entry['increment']:+.2f}%, {detail})"
             manual = entry.get("manual")
             if manual and cumulative is not None:
                 fraction = (
@@ -396,8 +396,8 @@ def _format_ranking_lines(
                 effective_count = math.floor(entry["count"] * fraction)
                 base += (
                     f"\n　　↳ 手動入力({manual['time_str']}) {manual['value']:.2f}% を反映。"
-                    f" 以降{manual['remaining_minutes']}分、"
-                    f" {effective_count}回のリフレ値を加算"
+                    f" 以降{manual['remaining_minutes']}分間の"
+                    f"{effective_count}回分のリフレ値を加算"
                 )
         return base
 
@@ -1437,12 +1437,32 @@ async def _play_alarm_in_vc(guild: discord.Guild, channel_id: int, sound_path: s
             await vc.disconnect()
 
 
+async def _check_missing_auto(all_configs: dict) -> list:
+    """現在〜次の1時間に、Shift シートで Auto と記入されたランナーが1人もいない
+    イベント(設定)の名前を返す。auto_ranking_check のアラート条件
+    (is_auto_period が全体で True になること)と同じ判定を使っており、
+    これに該当するとアラームが鳴る機会が無いまま終わってしまう。"""
+    missing = []
+    now = now_jst()
+    for ss_id, cfg in all_configs.items():
+        try:
+            in_auto_now = await asyncio.to_thread(shift_manager.is_auto_period, ss_id, now)
+            in_auto_next = await asyncio.to_thread(shift_manager.is_auto_period, ss_id, now + timedelta(hours=1))
+        except Exception as e:
+            print(f"[set_alarm] Auto判定に失敗 ({ss_id}): {type(e).__name__}: {e}")
+            continue
+        if not in_auto_now and not in_auto_next:
+            missing.append(cfg.get("EventName") or ss_id)
+    return missing
+
 class AlarmSetView(discord.ui.View):
-    def __init__(self, vc_channel: discord.VoiceChannel, file: discord.Attachment | None, guild_id: int):
+    def __init__(self, vc_channel: discord.VoiceChannel, file: discord.Attachment | None, guild_id: int,
+                 missing_auto: list = None):
         super().__init__(timeout=60)
         self.vc_channel = vc_channel
         self.file = file
         self.guild_id = guild_id
+        self.missing_auto = missing_auto or []
 
     @discord.ui.button(label="このVCで設定する", style=discord.ButtonStyle.primary)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1478,8 +1498,12 @@ class AlarmSetView(discord.ui.View):
             await scheduler.start_or_restart(self.guild_id, ss_id, cfg, on_event_start=_on_event_start)
 
         sound_label = self.file.filename if self.file else "デフォルト音"
+        warning = (
+            f"\n⚠️ Shift シート上で、現在〜次の1時間にAutoと記入されたランナーが見つかりません"
+            f"（{', '.join(self.missing_auto)}）。この状態のままだとアラームは鳴りません。Shift シートの記入をご確認ください。"
+        ) if self.missing_auto else ""
         await interaction.followup.send(
-            f"🔔 アラームを設定しました。\n- VC: **{self.vc_channel.name}**\n- 音声: {sound_label}",
+            f"🔔 アラームを設定しました。\n- VC: **{self.vc_channel.name}**\n- 音声: {sound_label}{warning}",
             ephemeral=True,
         )
 
@@ -1499,9 +1523,23 @@ async def set_alarm(interaction: discord.Interaction, file: discord.Attachment =
     vc_channel = interaction.user.voice.channel
     guild_id = interaction.guild_id or 0
     sound_label = f"（音声: {file.filename}）" if file else ""
+
+    missing_auto = []
+    try:
+        all_configs = storage.load_all_guild_configs(guild_id)
+        if all_configs:
+            missing_auto = await _check_missing_auto(all_configs)
+    except Exception as e:
+        print(f"[set_alarm] Auto判定に失敗: {type(e).__name__}: {e}")
+
+    warning = (
+        f"\n⚠️ Shift シート上で、現在〜次の1時間にAutoと記入されたランナーが見つかりません"
+        f"（{', '.join(missing_auto)}）。この状態のままだとアラームは鳴りません。Shift シートの記入をご確認ください。"
+    ) if missing_auto else ""
+
     await interaction.response.send_message(
-        f"🔔 **{vc_channel.name}** でアラームを設定します{sound_label}。よろしいですか？",
-        view=AlarmSetView(vc_channel, file, guild_id),
+        f"🔔 **{vc_channel.name}** でアラームを設定します{sound_label}。よろしいですか？{warning}",
+        view=AlarmSetView(vc_channel, file, guild_id, missing_auto=missing_auto),
         ephemeral=True,
     )
 
