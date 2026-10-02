@@ -28,6 +28,16 @@ def _find_tracking_refs(sh, trackings: list, config_sheet: str = "Config") -> li
         pass
     return []
 
+def refle_value_header(tracking) -> str:
+    return f"{tracking}_リフレ値"
+
+def _is_player_tracking(t) -> bool:
+    """main.py の _is_player と同じ判定: 文字列(ユーザー名/TwitterID)または15桁以上の数値IDのみ対象。
+    1,2,3... のような順位トラッキングにはリフレ値列を作らない。"""
+    if isinstance(t, str):
+        return True
+    return isinstance(t, int) and len(str(abs(t))) >= 15
+
 def format_pt_table(spreadsheet_id: str,
                     start: datetime,
                     end: datetime,
@@ -44,23 +54,29 @@ def format_pt_table(spreadsheet_id: str,
         t += timedelta(minutes=interval_minutes)
 
     n_rows = 1 + len(times)
-    n_cols = 2 + max(len(trackings), 0) + 1  # +1 for リフレ値ログ
+    refle_headers = [refle_value_header(x) for x in trackings if _is_player_tracking(x)]
+    n_cols = 2 + max(len(trackings), 0) + len(refle_headers)
 
     existing = next((ws for ws in sh.worksheets() if ws.title == sheet_title), None)
+    old_values = None
     if existing is not None:
         if existing.row_count == n_rows and existing.col_count >= n_cols:
             return
+        old_values = existing.get_all_values()  # 列構成変更で再作成する前に既存ログを退避
         sh.del_worksheet(existing)
 
     ws = gspread_manager.create_sheet(sh, sheet_title, n_rows, max(n_cols, 2))
 
     tracking_refs = _find_tracking_refs(sh, trackings)
     tracking_headers = tracking_refs if tracking_refs else [str(x) for x in trackings]
-    header = ["日付", "時間"] + tracking_headers + ["リフレ値ログ"]
+    header = ["日付", "時間"] + tracking_headers + refle_headers
     ws.update(values=[header], range_name=f"A1:{_col_letter(len(header))}1",
               value_input_option="USER_ENTERED")
+    # tracking_headers がセル参照式の場合、列照合には評価後の表示値を使う
+    new_header_display = ws.row_values(1)
+    new_header_display += [""] * (len(header) - len(new_header_display))
 
-    zero_row = [0] * (len(header) - 1) + [""]  # リフレ値ログ列は空欄
+    zero_row = [0] * len(header)
     ws.update(values=[zero_row], range_name=f"A2:{_col_letter(len(header))}2")
 
     day_hour_rows = []
@@ -73,6 +89,51 @@ def format_pt_table(spreadsheet_id: str,
         prev_date = d
 
     ws.update(values=day_hour_rows, range_name=f"A2:B{1 + len(times)}")
+
+    if old_values:
+        _migrate_pt_table_data(ws, new_header_display, day_hour_rows, old_values)
+
+def _forward_fill_daytime(day_time_pairs) -> list:
+    """日付列は日付が変わった行にしか入っていないため、直近の日付で埋めて (日付, 時間) の組にする。"""
+    result = []
+    last_day = None
+    for day, tm in day_time_pairs:
+        if day:
+            last_day = day
+        result.append((last_day, tm))
+    return result
+
+def _migrate_pt_table_data(ws, new_header_display: list, new_day_hour_rows: list, old_values: list) -> None:
+    """列構成が変わってシートを再作成した際、見出しと(日付,時間)が一致する既存データを新シートへ引き継ぐ。"""
+    if not old_values:
+        return
+    old_header = old_values[0] if old_values else []
+    old_rows = old_values[1:]
+
+    old_daytime = _forward_fill_daytime(
+        (r[0] if len(r) > 0 else "", r[1] if len(r) > 1 else "") for r in old_rows
+    )
+    old_row_by_daytime = {dt: r for dt, r in zip(old_daytime, old_rows) if dt[0] and dt[1]}
+
+    new_daytime = _forward_fill_daytime(new_day_hour_rows)
+
+    old_col_index = {h: i for i, h in enumerate(old_header) if h}
+    shared_cols = [h for h in new_header_display[2:] if h in old_col_index]
+    if not shared_cols:
+        return
+
+    header_to_col = {h: i + 1 for i, h in enumerate(new_header_display)}
+
+    for h in shared_cols:
+        oi = old_col_index[h]
+        col_values = []
+        for dt_key in new_daytime:
+            old_row = old_row_by_daytime.get(dt_key)
+            col_values.append([old_row[oi] if old_row is not None and oi < len(old_row) else ""])
+        if not any(v[0] for v in col_values):
+            continue  # コピーする値が無ければ書き込み自体をスキップ
+        col_letter = _col_letter(header_to_col[h])
+        ws.update(values=col_values, range_name=f"{col_letter}2:{col_letter}{1 + len(col_values)}")
 
 def _col_letter(n: int) -> str:
     if n < 1:
@@ -180,3 +241,21 @@ def write_values(spreadsheet_id: str,
     if not data_requests:
         return  # all columns already written for this row
     ws.batch_update(data_requests)
+
+def get_cumulative_value(spreadsheet_id: str,
+                         header_name: str,
+                         sheet_title: str = "PtLogs") -> float:
+    """指定した列の数値をすべて合算して返す（累積リフレ値の算出用）。"""
+    sh = gspread_manager.load_sheet(spreadsheet_id)
+    ws = sh.worksheet(sheet_title)
+    header = ws.row_values(1)
+    if header_name not in header:
+        return 0.0
+    col = header.index(header_name) + 1
+    total = 0.0
+    for v in ws.col_values(col)[1:]:
+        try:
+            total += float(v)
+        except (TypeError, ValueError):
+            continue
+    return total

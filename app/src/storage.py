@@ -94,6 +94,28 @@ def load_all_configs() -> Dict[Tuple[int, str], Dict[str, Any]]:
             result[(guild_id, ss_id)] = cfg
     return result
 
+def _pending_refle_key(guild_id: int, spreadsheet_id: str, tracking_key) -> str:
+    return f"{guild_id}:{spreadsheet_id}:{tracking_key}"
+
+def save_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key, value: float, time_iso: str) -> None:
+    """次回の時報で消化される、プレイヤーごとの手動リフレ値補正(値・入力時刻)を保存する。"""
+    data = _read_all()
+    pending = data.setdefault("_pending_refle", {})
+    pending[_pending_refle_key(guild_id, spreadsheet_id, tracking_key)] = {"value": value, "time": time_iso}
+    _write_all(data)
+
+def get_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key) -> Optional[Dict[str, Any]]:
+    data = _read_all()
+    return data.get("_pending_refle", {}).get(_pending_refle_key(guild_id, spreadsheet_id, tracking_key))
+
+def clear_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key) -> None:
+    data = _read_all()
+    pending = data.get("_pending_refle", {})
+    key = _pending_refle_key(guild_id, spreadsheet_id, tracking_key)
+    if key in pending:
+        pending.pop(key)
+        _write_all(data)
+
 def delete_guild_config(guild_id: int, spreadsheet_id: str = None) -> None:
     data = _read_all()
     guilds = data.get("guilds", {})
