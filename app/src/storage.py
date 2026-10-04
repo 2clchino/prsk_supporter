@@ -1,12 +1,29 @@
 # storage.py
 from __future__ import annotations
 import json
+import fcntl
+import contextlib
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import os as _os
 _DATA_DIR = Path(_os.environ.get("DATA_DIR", "."))
 _STORE_PATH = _DATA_DIR / "config_store.json"
+_LOCK_PATH = _DATA_DIR / "config_store.lock"
+
+@contextlib.contextmanager
+def _locked():
+    """読み取り→変更→書き込みの一連の処理全体をファイルロックで保護する。
+    ECSのローリングデプロイ中は新旧タスクが短時間同時に動くなど、複数プロセスから
+    同じ config_store.json に同時アクセスすることがあり、ロックが無いと更新の
+    取りこぼし(lost update)や、一時ファイルの競合によるクラッシュが起こる。"""
+    _DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_LOCK_PATH, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 def _read_all() -> Dict[str, Any]:
     if not _STORE_PATH.exists():
@@ -17,7 +34,10 @@ def _read_all() -> Dict[str, Any]:
         return {}
 
 def _write_all(data: Dict[str, Any]) -> None:
-    tmp = _STORE_PATH.with_suffix(".tmp")
+    # プロセスごとに異なる一時ファイル名を使う。複数プロセスが同時に書き込む場合でも
+    # (ロックで直列化されていても、ロック取得前に進行中の処理がいる可能性があるため)
+    # 同じ一時ファイルを取り合って FileNotFoundError になることを避ける。
+    tmp = _STORE_PATH.with_suffix(f".tmp.{_os.getpid()}")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(_STORE_PATH)
 
@@ -33,45 +53,49 @@ def _get_guild_spreadsheets(data: Dict[str, Any], guild_id_str: str) -> Dict[str
     return {k: v for k, v in guild_data.items() if isinstance(v, dict)}
 
 def try_acquire_lease(guild_id: int, instance_id: str, ttl_sec: int = 3600) -> bool:
-    data = _read_all()
-    leases = data.setdefault("_leases", {})
-    from time import time
-    now = time()
-    info = leases.get(str(guild_id))
-    if info and now < info.get("expires_at", 0) and info.get("instance_id") != instance_id:
-        return False
-    leases[str(guild_id)] = {"instance_id": instance_id, "expires_at": now + ttl_sec}
-    _write_all(data)
-    return True
+    with _locked():
+        data = _read_all()
+        leases = data.setdefault("_leases", {})
+        from time import time
+        now = time()
+        info = leases.get(str(guild_id))
+        if info and now < info.get("expires_at", 0) and info.get("instance_id") != instance_id:
+            return False
+        leases[str(guild_id)] = {"instance_id": instance_id, "expires_at": now + ttl_sec}
+        _write_all(data)
+        return True
 
 def mark_tick_if_new(guild_id: int, spreadsheet_id: str, tick_iso: str) -> bool:
-    data = _read_all()
-    ticks = data.setdefault("_ticks", {})
-    key = f"{guild_id}:{spreadsheet_id}"
-    if ticks.get(key) == tick_iso:
-        return False
-    ticks[key] = tick_iso
-    _write_all(data)
-    return True
+    with _locked():
+        data = _read_all()
+        ticks = data.setdefault("_ticks", {})
+        key = f"{guild_id}:{spreadsheet_id}"
+        if ticks.get(key) == tick_iso:
+            return False
+        ticks[key] = tick_iso
+        _write_all(data)
+        return True
 
 def release_lease(guild_id: int, instance_id: str):
-    data = _read_all()
-    leases = data.get("_leases", {})
-    if leases.get(str(guild_id), {}).get("instance_id") == instance_id:
-        leases.pop(str(guild_id), None)
-        _write_all(data)
+    with _locked():
+        data = _read_all()
+        leases = data.get("_leases", {})
+        if leases.get(str(guild_id), {}).get("instance_id") == instance_id:
+            leases.pop(str(guild_id), None)
+            _write_all(data)
 
 def save_guild_config(guild_id: int, cfg: Dict[str, Any]) -> None:
-    data = _read_all()
-    guilds = data.setdefault("guilds", {})
-    guild_str = str(guild_id)
-    # migrate old flat format
-    if _is_old_format(guilds.get(guild_str, {})):
-        old = guilds[guild_str]
-        old_ss = old.get("SpreadsheetID", "")
-        guilds[guild_str] = {old_ss: old} if old_ss else {}
-    guilds.setdefault(guild_str, {})[cfg["SpreadsheetID"]] = cfg
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        guilds = data.setdefault("guilds", {})
+        guild_str = str(guild_id)
+        # migrate old flat format
+        if _is_old_format(guilds.get(guild_str, {})):
+            old = guilds[guild_str]
+            old_ss = old.get("SpreadsheetID", "")
+            guilds[guild_str] = {old_ss: old} if old_ss else {}
+        guilds.setdefault(guild_str, {})[cfg["SpreadsheetID"]] = cfg
+        _write_all(data)
 
 def load_guild_config(guild_id: int, spreadsheet_id: str) -> Optional[Dict[str, Any]]:
     data = _read_all()
@@ -99,34 +123,37 @@ def _pending_refle_key(guild_id: int, spreadsheet_id: str, tracking_key) -> str:
 
 def save_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key, value: float, time_iso: str) -> None:
     """次回の時報で消化される、プレイヤーごとの手動リフレ値補正(値・入力時刻)を保存する。"""
-    data = _read_all()
-    pending = data.setdefault("_pending_refle", {})
-    pending[_pending_refle_key(guild_id, spreadsheet_id, tracking_key)] = {"value": value, "time": time_iso}
-    _write_all(data)
+    with _locked():
+        data = _read_all()
+        pending = data.setdefault("_pending_refle", {})
+        pending[_pending_refle_key(guild_id, spreadsheet_id, tracking_key)] = {"value": value, "time": time_iso}
+        _write_all(data)
 
 def get_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key) -> Optional[Dict[str, Any]]:
     data = _read_all()
     return data.get("_pending_refle", {}).get(_pending_refle_key(guild_id, spreadsheet_id, tracking_key))
 
 def clear_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key) -> None:
-    data = _read_all()
-    pending = data.get("_pending_refle", {})
-    key = _pending_refle_key(guild_id, spreadsheet_id, tracking_key)
-    if key in pending:
-        pending.pop(key)
-        _write_all(data)
+    with _locked():
+        data = _read_all()
+        pending = data.get("_pending_refle", {})
+        key = _pending_refle_key(guild_id, spreadsheet_id, tracking_key)
+        if key in pending:
+            pending.pop(key)
+            _write_all(data)
 
 def delete_guild_config(guild_id: int, spreadsheet_id: str = None) -> None:
-    data = _read_all()
-    guilds = data.get("guilds", {})
-    guild_str = str(guild_id)
-    if spreadsheet_id:
-        if _is_old_format(guilds.get(guild_str, {})):
-            guilds.pop(guild_str, None)
-        else:
-            guilds.get(guild_str, {}).pop(spreadsheet_id, None)
-            if not guilds.get(guild_str):
+    with _locked():
+        data = _read_all()
+        guilds = data.get("guilds", {})
+        guild_str = str(guild_id)
+        if spreadsheet_id:
+            if _is_old_format(guilds.get(guild_str, {})):
                 guilds.pop(guild_str, None)
-    else:
-        guilds.pop(guild_str, None)
-    _write_all(data)
+            else:
+                guilds.get(guild_str, {}).pop(spreadsheet_id, None)
+                if not guilds.get(guild_str):
+                    guilds.pop(guild_str, None)
+        else:
+            guilds.pop(guild_str, None)
+        _write_all(data)

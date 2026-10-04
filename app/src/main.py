@@ -318,6 +318,7 @@ async def _compute_refle_info(
         else:
             new_cumulative = prior_cumulative + count * REFLE_VALUE_RATE
 
+        new_cumulative = max(0.0, min(100.0, new_cumulative))  # リフレ値は 0%〜100% の範囲
         new_cumulative = round(new_cumulative, 2)
         increment = round(new_cumulative - prior_cumulative, 2)
 
@@ -611,11 +612,17 @@ class MissingUsersView(discord.ui.View):
             _logger_prev_scores.setdefault((self.guild_id, self.spreadsheet_id), {})[tracking_key] = score
 
 async def _resolve_prev_state(
-    spreadsheet_id: str, trackings: list, memory_prev: dict, memory_prev_deltas: dict,
+    spreadsheet_id: str, last_time: str, trackings: list, memory_prev: dict, memory_prev_deltas: dict,
 ) -> tuple[dict, dict]:
     """メモリ上(_logger_prev_scores/_logger_prev_deltas)に前回値・前回増分(加速度表示用)が
     無いトラッキング対象について、PtLogs シートから一括で補完する。Bot再起動直後など
     メモリが空の場合でも、シートに記録済みの値から復元できるようにするためのフォールバック。
+
+    今回これから書き込む行(last_time に最も近い行)の、真上の行のみを前回値とみなす。
+    真上の行が空欄の場合は、さらに遡って古い値を探すことはしない
+    (間に未記録の区間があるのに古い値を前回値扱いしてしまうと、複数区間分の
+    増分を1区間分として誤計算してしまうため)。
+
     トラッキング数が多い場合に1件ずつシートへアクセスするとAPIクォータに当たりやすいため、
     不足分はまとめて1回のシート読み取り(get_recent_values_bulk)で取得する。
     必ず、今回のスコアを PtLogs に書き込む前に呼び出すこと（書き込んだ後だと
@@ -628,7 +635,7 @@ async def _resolve_prev_state(
 
     try:
         bulk = await asyncio.to_thread(
-            ptlogger.get_recent_values_bulk, spreadsheet_id, [str(k) for k in missing], 2,
+            ptlogger.get_recent_values_bulk, spreadsheet_id, [str(k) for k in missing], last_time, 2,
         )
     except Exception as e:
         print(f"[prev_score] 前回値の一括取得に失敗: {type(e).__name__}: {e}")
@@ -661,7 +668,7 @@ async def ranking_logger(ctx: dict) -> None:
         # メモリ(_logger_prev_scores等)に無ければシートから復元する(Bot再起動直後など)。
         mem_key = (guild_id, spreadsheet_id)
         prev_scores, prev_deltas = await _resolve_prev_state(
-            cfg["SpreadsheetID"], trackings,
+            cfg["SpreadsheetID"], last_time, trackings,
             _logger_prev_scores.get(mem_key, {}), _logger_prev_deltas.get(mem_key, {}),
         )
 
@@ -764,10 +771,10 @@ async def auto_ranking_check(ctx: dict) -> str:
     spreadsheet_id = ctx["spreadsheet_id"]
     channel = ctx.get("channel")
 
-    in_auto = await asyncio.to_thread(
-        shift_manager.is_auto_period, cfg.get("SpreadsheetID"), now_jst()
+    auto_runner_names = await asyncio.to_thread(
+        shift_manager.get_auto_runner_names_at, cfg.get("SpreadsheetID"), now_jst()
     )
-    if not in_auto:
+    if not auto_runner_names:
         return None
 
     async def _run_once():
@@ -813,6 +820,7 @@ async def auto_ranking_check(ctx: dict) -> str:
     stalled_keys = [
         k for k in scores
         if _is_player(k) and k in prev and scores[k] is not None and prev[k] is not None and scores[k] <= prev[k]
+        and t2r.get(k) in auto_runner_names  # 本人がAuto中でなければ「停滞」として扱わない
     ]
     if stalled_keys and channel:
         stalled_lines = [f"{t2r.get(k, k)}: {scores[k]:,}（前回 {prev[k]:,}）" for k in stalled_keys]
@@ -1363,6 +1371,12 @@ async def play_sound(interaction: discord.Interaction, file: discord.Attachment 
 
     vc: discord.VoiceClient = discord.utils.get(bot.voice_clients, guild=interaction.guild)
     try:
+        if vc is not None and not vc.is_connected():
+            # 前回の接続タイムアウト等で未接続のVoiceClientが残っていると、
+            # 再接続されないまま play() が "Not connected to voice." で失敗し続けるため破棄する
+            print("[play_sound] 未接続のVoiceClientを破棄")
+            await vc.disconnect(force=True)
+            vc = None
         if vc is None:
             print("[play_sound] VCに接続中...")
             vc = await asyncio.wait_for(vc_channel.connect(), timeout=15.0)
@@ -1414,6 +1428,12 @@ async def _play_alarm_in_vc(guild: discord.Guild, channel_id: int, sound_path: s
         return
     vc: discord.VoiceClient = discord.utils.get(bot.voice_clients, guild=guild)
     try:
+        if vc is not None and not vc.is_connected():
+            # 前回の接続タイムアウト等で未接続のVoiceClientが残っていると、
+            # 再接続されないまま play() が "Not connected to voice." で失敗し続けるため破棄する
+            print("[alarm] 未接続のVoiceClientを破棄")
+            await vc.disconnect(force=True)
+            vc = None
         if vc is None:
             vc = await asyncio.wait_for(vc_channel.connect(), timeout=15.0)
         elif vc.channel != vc_channel:

@@ -60,7 +60,13 @@ def format_pt_table(spreadsheet_id: str,
     existing = next((ws for ws in sh.worksheets() if ws.title == sheet_title), None)
     old_values = None
     if existing is not None:
-        if existing.row_count == n_rows and existing.col_count >= n_cols:
+        existing_header = existing.row_values(1)
+        existing_header_set = {h.strip() for h in existing_header if h}
+        # リフレ値列はConfigへの数式参照ではなくプレーン文字列の見出しのため、
+        # Trackingsを同じ人数のまま別の対象に入れ替えた場合、行数・列数だけでは
+        # 変更を検知できない。見出しの内容まで比較する。
+        has_all_refle_cols = all(h in existing_header_set for h in refle_headers)
+        if existing.row_count == n_rows and existing.col_count >= n_cols and has_all_refle_cols:
             return
         old_values = existing.get_all_values()  # 列構成変更で再作成する前に既存ログを退避
         sh.del_worksheet(existing)
@@ -145,12 +151,19 @@ def _col_letter(n: int) -> str:
     return ''.join(reversed(result))
 
 import math
-def write_values(spreadsheet_id: str,
-                 iso_timestamp: str,
-                 values_by_header: Dict[Union[int, str], Any],
-                 tz_name: str = "Asia/Tokyo",
-                 sheet_title: str = "PtLogs",
-                 overwrite: bool = False) -> None:
+
+def _parse_day_cell(s: str) -> Optional[Tuple[int, int]]:
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", s.strip())
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+def _find_row_for_timestamp(col_a: List[str], col_b: List[str], iso_timestamp: str,
+                            tz_name: str = "Asia/Tokyo") -> Optional[int]:
+    """日付列(A)・時間列(B)から、iso_timestamp に最も近い行番号(1-based)を返す。
+    write_values の書き込み先行と、前回値の参照元行を一致させるために共通化している。"""
     ts = iso_timestamp.strip()
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
@@ -159,24 +172,8 @@ def write_values(spreadsheet_id: str,
     target_day_str = f"{dt_local.month}/{dt_local.day}"
     tgt_seconds = dt_local.hour * 3600 + dt_local.minute * 60 + dt_local.second
 
-    sh = gspread_manager.load_sheet(spreadsheet_id)
-    ws = sh.worksheet(sheet_title)
-
-    header = ws.row_values(1)
-    header_map = {h: idx + 1 for idx, h in enumerate(header) if h}
-
-    col_a = ws.col_values(1)
-    col_b = ws.col_values(2)
     n_rows = max(len(col_a), len(col_b))
     data_start_row = 2
-
-    def parse_day_cell(s: str) -> Optional[Tuple[int, int]]:
-        if not s:
-            return None
-        m = re.fullmatch(r"(\d{1,2})/(\d{1,2})", s.strip())
-        if not m:
-            return None
-        return int(m.group(1)), int(m.group(2))
 
     best_row = None
     best_diff = math.inf
@@ -185,7 +182,7 @@ def write_values(spreadsheet_id: str,
     for r in range(data_start_row, n_rows + 1):
         day_cell = col_a[r-1] if r-1 < len(col_a) else ""
         time_cell = col_b[r-1] if r-1 < len(col_b) else ""
-        md = parse_day_cell(day_cell)
+        md = _parse_day_cell(day_cell)
         if md is not None:
             current_month_day = md
         if current_month_day is None:
@@ -215,8 +212,28 @@ def write_values(spreadsheet_id: str,
                 best_row = r
                 best_minutes = cur_minutes
 
+    return best_row
+
+def write_values(spreadsheet_id: str,
+                 iso_timestamp: str,
+                 values_by_header: Dict[Union[int, str], Any],
+                 tz_name: str = "Asia/Tokyo",
+                 sheet_title: str = "PtLogs",
+                 overwrite: bool = False) -> None:
+    sh = gspread_manager.load_sheet(spreadsheet_id)
+    ws = sh.worksheet(sheet_title)
+
+    header = ws.row_values(1)
+    header_map = {h: idx + 1 for idx, h in enumerate(header) if h}
+
+    col_a = ws.col_values(1)
+    col_b = ws.col_values(2)
+
+    best_row = _find_row_for_timestamp(col_a, col_b, iso_timestamp, tz_name)
     if best_row is None:
-        raise ValueError(f"対象日 {target_day_str} の行が見つかりませんでした。")
+        ts = iso_timestamp.strip()
+        dt_local = datetime.fromisoformat(ts[:-1] + "+00:00" if ts.endswith("Z") else ts).astimezone(ZoneInfo(tz_name))
+        raise ValueError(f"対象日 {dt_local.month}/{dt_local.day} の行が見つかりませんでした。")
 
     data_requests = []
     ranges = []
@@ -281,9 +298,19 @@ def get_last_n_values(spreadsheet_id: str,
 
 def get_recent_values_bulk(spreadsheet_id: str,
                            header_names: List[str],
+                           iso_timestamp: str,
                            n: int = 2,
+                           tz_name: str = "Asia/Tokyo",
                            sheet_title: str = "PtLogs") -> Dict[str, List[float]]:
-    """複数列について、直近 n 件の値(古い→新しい順)をまとめて取得する。
+    """複数列について、これから書き込む行(iso_timestampに最も近い行)の直前の行から、
+    古い→新しい順で連続する値を最大 n 件まとめて取得する。
+
+    write_values と同じ行特定ロジックを使い、「真上の行」から連続して遡るだけで、
+    途中に空欄があっても遠くの行まで探しに行かない（間に未記録の区間があるのに
+    古い値を拾ってしまい、複数区間分の増分を1区間分として誤計算するのを防ぐため）。
+    そのため、直前の行が空欄なら結果は空リストになる(1つ前は無いが2つ前にはある、
+    というケースは前回値として使わない)。
+
     シート全体を1回読むだけで済むため、列数(トラッキング数)が多い場合でも
     APIクォータを消費しにくい（Bot再起動直後に全トラッキング分の前回値を
     復元する際など、列ごとに個別アクセスするとレート制限に当たりやすいため）。"""
@@ -295,25 +322,33 @@ def get_recent_values_bulk(spreadsheet_id: str,
     all_values = ws.get_all_values()
     if not all_values:
         return result
+
+    col_a = [row[0] if len(row) > 0 else "" for row in all_values]
+    col_b = [row[1] if len(row) > 1 else "" for row in all_values]
+    target_row = _find_row_for_timestamp(col_a, col_b, iso_timestamp, tz_name)
+    if target_row is None:
+        return result
+
     header = all_values[0]
     col_index = {h: i for i, h in enumerate(header) if h}
-    rows = all_values[1:]
     for h in header_names:
         idx = col_index.get(h)
         if idx is None:
             continue
         vals: List[float] = []
-        for row in reversed(rows):
+        # target_row は1-based。直前の行から真上方向へ、空欄に当たるまで連続して集める。
+        for r in range(target_row - 1, target_row - 1 - n, -1):
+            if r < 2:  # 1行目はヘッダー
+                break
+            row = all_values[r - 1]
             if idx >= len(row):
-                continue
+                break
             cell = row[idx]
             if cell is None or str(cell).strip() == "":
-                continue
+                break
             try:
                 vals.append(float(cell))
             except (TypeError, ValueError):
-                continue
-            if len(vals) >= n:
                 break
         vals.reverse()
         result[h] = vals

@@ -249,26 +249,27 @@ def extract_nearest_shift(
         max_shifters_per_block=max_shifters_per_block,
     )
 
-def is_auto_period(
+def get_auto_runner_names_at(
     spreadsheet_id: str,
     dt: datetime,
     sheet_title: str = "Shift",
-    runner_name: str = None,
-) -> bool:
-    """runner_name を指定すると、その Runner 専用列が "Auto" になっているかどうかで判定する
-    (プレイヤー別のAuto判定)。省略時は従来通り、いずれかの列が "Auto" なら True を返す。"""
+) -> set:
+    """指定した時刻に "Auto" となっている列の見出し(Runner名、または支援者N/アンコ)の
+    集合を返す。シートを1回読むだけで複数プレイヤーのAuto判定ができるため、
+    プレイヤーごとに is_auto_period を個別に呼ぶより効率的。"""
     tz = dt.tzinfo or ZoneInfo("Asia/Tokyo")
     try:
         data = gspread_manager.load_table(spreadsheet_id, sheet_title)
     except Exception:
-        return False
+        return set()
     if not data or len(data) < 2:
-        return False
+        return set()
 
     header_row = data[0]
     date_cols = find_date_columns(header_row)
     target_date = dt.date()
 
+    result = set()
     for i, date_col in enumerate(date_cols):
         col_date = parse_date(header_row[date_col].strip(), tz)
         if col_date != target_date:
@@ -287,13 +288,24 @@ def is_auto_period(
             for c in range(date_col + 1, next_date_col):
                 if c >= len(data[r]):
                     continue
-                if runner_name is not None:
-                    header_text = header_row[c].strip() if c < len(header_row) else ""
-                    if header_text != runner_name:
-                        continue
                 if data[r][c].strip().lower() == "auto":
-                    return True
-    return False
+                    header_text = header_row[c].strip() if c < len(header_row) else ""
+                    if header_text:
+                        result.add(header_text)
+    return result
+
+def is_auto_period(
+    spreadsheet_id: str,
+    dt: datetime,
+    sheet_title: str = "Shift",
+    runner_name: str = None,
+) -> bool:
+    """runner_name を指定すると、その Runner 専用列が "Auto" になっているかどうかで判定する
+    (プレイヤー別のAuto判定)。省略時は従来通り、いずれかの列が "Auto" なら True を返す。"""
+    auto_names = get_auto_runner_names_at(spreadsheet_id, dt, sheet_title)
+    if runner_name is not None:
+        return runner_name in auto_names
+    return bool(auto_names)
 
 
 def get_auto_hours(
