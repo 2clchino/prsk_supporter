@@ -1,4 +1,7 @@
 discord.py[voice]
+# discord.py 2.7.1 は davey 0.2 で追加されたトランジション処理(execute_transition)に未対応で、
+# 0.2 だと E2EE(DAVE)のセッションが準備完了にならず VC で音声が再生されないため 0.1 系に固定する
+davey<0.2
 python-dotenv
 pandas
 numpy

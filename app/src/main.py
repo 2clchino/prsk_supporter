@@ -17,7 +17,7 @@ import ptlogger
 import minute_logger
 import storage
 from timeutils import ensure_aware_jst, now_jst, JST
-from scheduler import EventScheduler, MultiMinuteRegistry
+from scheduler import EventScheduler, MultiMinuteRegistry, _safe_send
 
 load_dotenv(override=False)
 TOKEN = os.environ["DISCORD_TOKEN"]
@@ -776,7 +776,10 @@ async def auto_ranking_check(ctx: dict) -> str:
     auto_runner_names = await asyncio.to_thread(
         shift_manager.get_auto_runner_names_at, cfg.get("SpreadsheetID"), now_jst()
     )
+    key = (guild_id, spreadsheet_id)
     if not auto_runner_names:
+        if _alarm_active(key) and _stop_alarm(guild_id, by_user=False) and channel:
+            await _safe_send(channel, "⏹ Auto の時間帯が終わったため、アラームを止めました。")
         return None
 
     async def _run_once():
@@ -795,7 +798,6 @@ async def auto_ranking_check(ctx: dict) -> str:
         print(f"{log_prefix}: データ取得失敗 ({type(e).__name__}: {e})")
         return None
 
-    key = (guild_id, spreadsheet_id)
     prev = _auto_prev_scores.get(key)
     _auto_prev_scores[key] = scores
 
@@ -816,6 +818,12 @@ async def auto_ranking_check(ctx: dict) -> str:
     ]
     print(f"{log_prefix}:\n" + "\n".join(log_lines) if log_lines else f"{log_prefix}: スコアなし")
 
+    if key in _alarm_skip_next:
+        # ユーザーがアラームを止めた直後の1回は、端末の確認・復旧の時間として判定しない
+        _alarm_skip_next.discard(key)
+        print(f"{log_prefix}: アラーム停止直後のため今回の判定はスキップします")
+        return None
+
     if prev is None:
         return None
 
@@ -824,21 +832,25 @@ async def auto_ranking_check(ctx: dict) -> str:
         if _is_player(k) and k in prev and scores[k] is not None and prev[k] is not None and scores[k] <= prev[k]
         and t2r.get(k) in auto_runner_names  # 本人がAuto中でなければ「停滞」として扱わない
     ]
-    if stalled_keys and channel:
+    if not stalled_keys:
+        if _alarm_active(key) and _stop_alarm(guild_id, by_user=False) and channel:
+            await _safe_send(channel, "✅ ポイントの増加を確認したため、アラームを止めました。")
+        return None
+    if channel:
         stalled_lines = [f"{t2r.get(k, k)}: {scores[k]:,}（前回 {prev[k]:,}）" for k in stalled_keys]
         mentions = " ".join(f"<@{t2did[k]}>" for k in stalled_keys if k in t2did)
         prefix = mentions + "\n" if mentions else ""
-        await channel.send(
-            prefix + "⚠️ オート期間中にポイント増加が確認できませんでした。次のユーザは端末を確認してください:\n" + "\n".join(stalled_lines)
-        )
         alarm_channel_id = cfg.get("AlarmChannelID")
-        if alarm_channel_id:
-            guild = bot.get_guild(guild_id)
-            if guild:
-                raw_sound = cfg.get("AlarmSoundPath")
-                _default_alarm = os.path.join(_SOUNDS_DIR, "alarm_0.mp3")
-                sound_path = raw_sound if raw_sound and os.path.exists(raw_sound) else _default_alarm
-                asyncio.create_task(_play_alarm_in_vc(guild, alarm_channel_id, sound_path))
+        guild = bot.get_guild(guild_id) if alarm_channel_id else None
+        await channel.send(
+            prefix + "⚠️ オート期間中にポイント増加が確認できませんでした。次のユーザは端末を確認してください:\n" + "\n".join(stalled_lines),
+            view=AlarmStopView(guild_id) if guild else discord.utils.MISSING,
+        )
+        if guild:
+            raw_sound = cfg.get("AlarmSoundPath")
+            _default_alarm = os.path.join(_SOUNDS_DIR, "alarm_0.mp3")
+            sound_path = raw_sound if raw_sound and os.path.exists(raw_sound) else _default_alarm
+            _start_alarm(guild, alarm_channel_id, sound_path, key)
     return None
 
 scheduler = EventScheduler(bot, registry, aux_loops=[minute_logger.run_loop])
@@ -888,6 +900,8 @@ async def help_command(interaction: discord.Interaction):
         "`/clear_setup` — 設定を削除し、定期実行を停止します。\n"
         "`/minutelog_targets <名前,名前,...>` — 'PtLogs1min' シート(1分毎のポイント推移)に記録するユーザーを、順位ではなくユーザー名で指定します（100位以内）。省略すると1〜5位に戻します。\n"
         "`/set_alarm` — Autoチェックのアラート時に、コマンド実行者がいるVCへBotが来てアラームを鳴らすよう設定します。\n"
+        "　アラームは止めるまで（または次回以降の監視でポイント増加を確認するまで）鳴り続けます。\n"
+        "　通知の「⏹ アラームを止める」ボタン、`/stop_alarm`、または VC から Bot を切断すると止まり、次回の監視は1回スキップします。\n"
         "　（例: 寝る前に寝床VCへ移動してから実行する想定）\n"
         "\n"
         "__**スプレッドシート設定項目**__\n"
@@ -1402,6 +1416,7 @@ async def play_sound(interaction: discord.Interaction, file: discord.Attachment 
                 os.remove(tmp_path)
             asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
 
+        await _wait_dave_ready(vc, "play_sound")
         vc.play(
             discord.FFmpegPCMAudio(sound_path, options="-af adelay=1500|1500"),
             after=after_play,
@@ -1426,13 +1441,83 @@ async def play_sound(interaction: discord.Interaction, file: discord.Attachment 
             await vc.disconnect()
 
 
-async def _play_alarm_in_vc(guild: discord.Guild, channel_id: int, sound_path: str) -> None:
-    """指定チャンネルに入って sound_path を再生し、完了後に退出する。"""
+def _log_dave_state(vc: discord.VoiceClient, tag: str) -> None:
+    """E2EE(DAVE)のセッションが準備できていないと音声が暗号化されずに送られ、相手側で再生されない。
+    準備が整わなかった場合の調査用に状態を出力する。"""
+    conn = vc._connection
+    session = conn.dave_session
+    print(f"[{tag}] DAVE: protocol={conn.dave_protocol_version} session={'あり' if session else 'なし'} "
+          f"ready={getattr(session, 'ready', None)} can_encrypt={conn.can_encrypt}")
+
+
+async def _wait_dave_ready(vc: discord.VoiceClient, tag: str, timeout: float = 15.0) -> bool:
+    """接続直後は E2EE(DAVE)のセッションが準備中で、この間に送った音声は暗号化されず相手側で再生されない。
+    準備が整うまで待つ。準備できた場合 True。"""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    while loop.time() - started < timeout:
+        if not vc.is_connected():
+            return False
+        conn = vc._connection
+        if conn.dave_protocol_version == 0 or conn.can_encrypt:
+            print(f"[{tag}] DAVE ready ({loop.time() - started:.1f}s, protocol={conn.dave_protocol_version})")
+            return True
+        await asyncio.sleep(0.2)
+    _log_dave_state(vc, tag)
+    print(f"[{tag}] DAVE の準備が {timeout:.0f} 秒以内に整いませんでした")
+    return False
+
+
+_ALARM_MAX_SECONDS = 2 * 60 * 60  # 止め忘れ・監視停止時に鳴り続けないための上限
+
+
+class _AlarmState:
+    def __init__(self, key: tuple):
+        self.key = key  # (guild_id, spreadsheet_id): どのスプレッドシートの監視で鳴らしたか
+        self.stop_event = asyncio.Event()
+        self.stopped_by_bot = False
+        self.task: asyncio.Task | None = None
+
+
+_alarms: dict[int, _AlarmState] = {}  # guild_id -> 鳴っているアラーム
+_alarm_skip_next: set[tuple] = set()  # ユーザーがアラームを止めた後、次の1回の監視をスキップする (guild_id, spreadsheet_id)
+
+
+def _alarm_active(key: tuple) -> bool:
+    state = _alarms.get(key[0])
+    return state is not None and state.key == key
+
+
+def _start_alarm(guild: discord.Guild, channel_id: int, sound_path: str, key: tuple) -> None:
+    """アラームを鳴らし始める。既に鳴っている場合は鳴らし直さない。"""
+    if guild.id in _alarms:
+        return
+    state = _AlarmState(key)
+    _alarms[guild.id] = state
+    state.task = asyncio.create_task(_alarm_loop(guild, channel_id, sound_path, state))
+
+
+def _stop_alarm(guild_id: int, *, by_user: bool) -> bool:
+    """鳴っているアラームを止める。by_user の場合は次の1回の監視をスキップする。止めた場合 True。"""
+    state = _alarms.pop(guild_id, None)
+    if state is None:
+        return False
+    state.stopped_by_bot = True
+    state.stop_event.set()
+    if by_user:
+        _alarm_skip_next.add(state.key)
+    return True
+
+
+async def _alarm_loop(guild: discord.Guild, channel_id: int, sound_path: str, state: _AlarmState) -> None:
+    """指定チャンネルに入って sound_path を、止められるまで繰り返し再生し、終わったら退出する。"""
     vc_channel = guild.get_channel(channel_id)
     if vc_channel is None:
         print(f"[alarm] channel {channel_id} not found in guild {guild.id}")
+        _alarms.pop(guild.id, None)
         return
     vc: discord.VoiceClient = discord.utils.get(bot.voice_clients, guild=guild)
+    started = asyncio.get_running_loop().time()
     try:
         if vc is not None and not vc.is_connected():
             # 前回の接続タイムアウト等で未接続のVoiceClientが残っていると、
@@ -1444,23 +1529,62 @@ async def _play_alarm_in_vc(guild: discord.Guild, channel_id: int, sound_path: s
             vc = await asyncio.wait_for(vc_channel.connect(), timeout=15.0)
         elif vc.channel != vc_channel:
             await asyncio.wait_for(vc.move_to(vc_channel), timeout=15.0)
-        if vc.is_playing():
-            vc.stop()
-
-        def after_alarm(err):
-            if err:
-                print(f"[alarm] 再生エラー: {err}")
-            asyncio.run_coroutine_threadsafe(vc.disconnect(), bot.loop)
-
-        vc.play(
-            discord.FFmpegPCMAudio(sound_path, options="-af adelay=1500|1500"),
-            after=after_alarm,
-        )
+        await _wait_dave_ready(vc, "alarm")
         print(f"[alarm] 再生開始: {vc_channel.name} / {sound_path}")
+
+        while not state.stop_event.is_set():
+            if not vc.is_connected():
+                # Bot が VC から切断された = ユーザーが止めたとみなす
+                print("[alarm] VCから切断されたため、ユーザーによる停止として扱います")
+                if _alarms.get(guild.id) is state:
+                    _stop_alarm(guild.id, by_user=True)
+                break
+            if asyncio.get_running_loop().time() - started > _ALARM_MAX_SECONDS:
+                print("[alarm] 上限時間に達したため停止します")
+                if _alarms.get(guild.id) is state:
+                    _stop_alarm(guild.id, by_user=False)
+                break
+            if vc.is_playing():
+                vc.stop()
+            finished = asyncio.Event()
+
+            def after_alarm(err, finished=finished):
+                if err:
+                    print(f"[alarm] 再生エラー: {err}")
+                bot.loop.call_soon_threadsafe(finished.set)
+
+            _log_dave_state(vc, "alarm")
+            vc.play(discord.FFmpegPCMAudio(sound_path, options="-af adelay=1500|1500"), after=after_alarm)
+            stop_wait = asyncio.create_task(state.stop_event.wait())
+            done_wait = asyncio.create_task(finished.wait())
+            await asyncio.wait({stop_wait, done_wait}, return_when=asyncio.FIRST_COMPLETED)
+            stop_wait.cancel()
+            done_wait.cancel()
+        print(f"[alarm] 停止: {vc_channel.name}")
     except Exception as e:
         print(f"[alarm] エラー: {type(e).__name__}: {e}")
+        if _alarms.get(guild.id) is state:
+            _alarms.pop(guild.id, None)
+    finally:
         if vc and vc.is_connected():
+            if vc.is_playing():
+                vc.stop()
             await vc.disconnect()
+
+
+class AlarmStopView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=_ALARM_MAX_SECONDS)
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="アラームを止める", emoji="⏹", style=discord.ButtonStyle.danger)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if _stop_alarm(self.guild_id, by_user=True):
+            await interaction.response.send_message(
+                f"⏹ {interaction.user.display_name} がアラームを止めました。次回の監視は1回スキップし、その次から再開します。"
+            )
+        else:
+            await interaction.response.send_message("アラームは鳴っていません。", ephemeral=True)
 
 
 async def _check_missing_auto(all_configs: dict) -> list:
@@ -1568,6 +1692,16 @@ async def set_alarm(interaction: discord.Interaction, file: discord.Attachment =
         view=AlarmSetView(vc_channel, file, guild_id, missing_auto=missing_auto),
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="stop_alarm", description="鳴っているアラームを止めます（次回の監視は1回スキップ）。")
+async def stop_alarm(interaction: discord.Interaction):
+    if _stop_alarm(interaction.guild_id or 0, by_user=True):
+        await interaction.response.send_message(
+            f"⏹ {interaction.user.display_name} がアラームを止めました。次回の監視は1回スキップし、その次から再開します。"
+        )
+    else:
+        await interaction.response.send_message("アラームは鳴っていません。", ephemeral=True)
 
 
 def _target_spreadsheets(guild_id: int, spreadsheet_id: str | None) -> dict:

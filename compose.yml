@@ -8,6 +8,8 @@ services:
       - ./app/src:/app/src
       - ./app/.env:/app/.env:ro
       - ./app/keys:/app/keys:ro
+      # config_store.json 等の設定を保存する。コンテナを作り直しても /setup の設定が消えないようにする
+      - ./app/data:/app/data
     command:
       - watchfiles
       - --target-type=command
@@ -17,6 +19,8 @@ services:
       - /app/.env
     env_file:
       - ./app/.env
+    environment:
+      DATA_DIR: /app/data
     restart: unless-stopped
     init: true
     logging:
