@@ -98,17 +98,21 @@ async def _to_thread(fn, *a, **kw):
     return await asyncio.to_thread(fn, *a, **kw)
 
 JobKey = Tuple[int, str]  # (guild_id, spreadsheet_id)
+# 毎時の分指定ではなく独自の周期で動く処理。(bot, guild_id, spreadsheet_id, cfg) を受け取る
+AuxLoop = Callable[[discord.Client, int, str, dict], Awaitable[None]]
 
 @dataclass
 class ManagedJob:
     task: asyncio.Task
     guild_id: int
     spreadsheet_id: str
+    aux_tasks: List[asyncio.Task]
 
 class EventScheduler:
-    def __init__(self, bot: discord.Client, registry: MultiMinuteRegistry) -> None:
+    def __init__(self, bot: discord.Client, registry: MultiMinuteRegistry, aux_loops: Optional[List[AuxLoop]] = None) -> None:
         self.bot = bot
         self.registry = registry
+        self.aux_loops = aux_loops or []
         self.jobs: Dict[JobKey, ManagedJob] = {}
         self._locks: Dict[JobKey, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -125,19 +129,23 @@ class EventScheduler:
         async with self._locks[key]:
             await self.stop(guild_id, spreadsheet_id)
             loop_task = asyncio.create_task(self._event_loop(guild_id, spreadsheet_id, cfg, on_event_start))
-            self.jobs[key] = ManagedJob(task=loop_task, guild_id=guild_id, spreadsheet_id=spreadsheet_id)
+            aux_tasks = [asyncio.create_task(aux(self.bot, guild_id, spreadsheet_id, cfg)) for aux in self.aux_loops]
+            self.jobs[key] = ManagedJob(task=loop_task, guild_id=guild_id, spreadsheet_id=spreadsheet_id, aux_tasks=aux_tasks)
 
     async def stop(self, guild_id: int, spreadsheet_id: str = None) -> None:
         keys = [(guild_id, spreadsheet_id)] if spreadsheet_id else \
                [k for k in list(self.jobs) if k[0] == guild_id]
         for key in keys:
             job = self.jobs.get(key)
-            if job and not job.task.done():
-                job.task.cancel()
-                try:
-                    await job.task
-                except asyncio.CancelledError:
-                    pass
+            if job:
+                for t in [job.task, *job.aux_tasks]:
+                    if t.done():
+                        continue
+                    t.cancel()
+                    try:
+                        await t
+                    except asyncio.CancelledError:
+                        pass
             self.jobs.pop(key, None)
 
     async def _event_loop(self, guild_id: int, spreadsheet_id: str, cfg: dict, on_event_start=None) -> None:

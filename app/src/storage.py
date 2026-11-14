@@ -142,6 +142,22 @@ def clear_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key) -> Non
             pending.pop(key)
             _write_all(data)
 
+def get_minute_log_players(guild_id: int, spreadsheet_id: str) -> list:
+    """1分毎ログで、順位の代わりに追跡するユーザー名のリストを返す(未設定なら空リスト=1〜5位を記録)。"""
+    data = _read_all()
+    return data.get("_minute_log_players", {}).get(f"{guild_id}:{spreadsheet_id}", [])
+
+def set_minute_log_players(guild_id: int, spreadsheet_id: str, players: list) -> None:
+    with _locked():
+        data = _read_all()
+        all_players = data.setdefault("_minute_log_players", {})
+        key = f"{guild_id}:{spreadsheet_id}"
+        if players:
+            all_players[key] = players
+        else:
+            all_players.pop(key, None)
+        _write_all(data)
+
 def delete_guild_config(guild_id: int, spreadsheet_id: str = None) -> None:
     with _locked():
         data = _read_all()

@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 import math
 import asyncio, random
@@ -13,6 +14,7 @@ import gspread_manager
 import sekai_api
 import shift_manager
 import ptlogger
+import minute_logger
 import storage
 from timeutils import ensure_aware_jst, now_jst, JST
 from scheduler import EventScheduler, MultiMinuteRegistry
@@ -839,7 +841,7 @@ async def auto_ranking_check(ctx: dict) -> str:
                 asyncio.create_task(_play_alarm_in_vc(guild, alarm_channel_id, sound_path))
     return None
 
-scheduler = EventScheduler(bot, registry)
+scheduler = EventScheduler(bot, registry, aux_loops=[minute_logger.run_loop])
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -884,6 +886,7 @@ async def help_command(interaction: discord.Interaction):
         "　初回実行時に 'PtLogs' シートと 'Shift' シートを作成・フォーマットします。\n"
         "`/status` — 現在の設定とスケジューラの状態を表示します。\n"
         "`/clear_setup` — 設定を削除し、定期実行を停止します。\n"
+        "`/minutelog_targets <名前,名前,...>` — 'PtLogs1min' シート(1分毎のポイント推移)に記録するユーザーを、順位ではなくユーザー名で指定します（100位以内）。省略すると1〜5位に戻します。\n"
         "`/set_alarm` — Autoチェックのアラート時に、コマンド実行者がいるVCへBotが来てアラームを鳴らすよう設定します。\n"
         "　（例: 寝る前に寝床VCへ移動してから実行する想定）\n"
         "\n"
@@ -1173,7 +1176,7 @@ async def setup(interaction: discord.Interaction, text: str = None):
     config = gspread_manager.read_config_values(text)
     await _execute_setup(interaction, config, text)
 
-async def _build_status_block(config: dict, status_str: str, *, ss_label: str = "") -> str:
+async def _build_status_block(config: dict, status_str: str, *, ss_label: str = "", guild_id: int = 0) -> str:
     is_wb = config.get("isWorldBloom")
     event_name_for_msg = config.get("EventName") or f"(ID: {config.get('EventID')})"
     chara_name = sekai_api._CHARA_ID_TO_NAME.get(config.get("CharaID"), str(config.get("CharaID"))) if is_wb else None
@@ -1205,6 +1208,8 @@ async def _build_status_block(config: dict, status_str: str, *, ss_label: str = 
 
     trk = config.get("Trackings", [])
     trk_str = ", ".join(str(t) for t in trk) if isinstance(trk, list) else (str(trk) if trk else "未設定")
+    minute_players = storage.get_minute_log_players(guild_id, config.get("SpreadsheetID")) if guild_id else []
+    minute_players_str = ", ".join(minute_players) or "1〜5位"
 
     header = f"{status_str}{' — ' + ss_label if ss_label else ''}"
     return (
@@ -1212,6 +1217,7 @@ async def _build_status_block(config: dict, status_str: str, *, ss_label: str = 
         f"- イベント名: {event_name_for_msg}\n"
         f"- 種別: {f'WL {chara_name} チャプター' if is_wb else '通常イベント'}\n"
         f"- 追跡対象: {trk_str}\n"
+        f"- 1分ログ記録対象（/minutelog_targets）: {minute_players_str}\n"
         f"- ランナー: {runners_str}\n"
         f"- 開始: {config.get('EventStart')}\n"
         f"- 終了: {config.get('EventEnd')}\n"
@@ -1221,7 +1227,7 @@ async def _build_status_block(config: dict, status_str: str, *, ss_label: str = 
     )
 
 async def _on_event_start(cfg: dict, guild_id: int, channel) -> None:
-    block = await _build_status_block(cfg, "▶ 稼働中")
+    block = await _build_status_block(cfg, "▶ 稼働中", guild_id=guild_id)
     await channel.send(f"**イベントが開始しました！**\n{block}")
 
 @bot.tree.command(name="status", description="現在の設定・スケジューラの状態を表示")
@@ -1263,7 +1269,7 @@ async def status(interaction: discord.Interaction):
                 status_str = "▶ 稼働中"
 
         ss_label = f"`...{spreadsheet_id[-8:]}`" if multi else ""
-        block = await _build_status_block(config, status_str, ss_label=ss_label)
+        block = await _build_status_block(config, status_str, ss_label=ss_label, guild_id=guild_id)
         view = StatusEditView(spreadsheet_id, config, guild_id)
         blocks.append((block, view))
 
@@ -1563,6 +1569,50 @@ async def set_alarm(interaction: discord.Interaction, file: discord.Attachment =
         ephemeral=True,
     )
 
+
+def _target_spreadsheets(guild_id: int, spreadsheet_id: str | None) -> dict:
+    all_configs = storage.load_all_guild_configs(guild_id)
+    if spreadsheet_id:
+        return {k: v for k, v in all_configs.items() if k == spreadsheet_id}
+    return all_configs
+
+def _parse_player_names(text: str | None) -> list[str]:
+    if not text:
+        return []
+    return list(dict.fromkeys(n.strip() for n in re.split(r"[,、，]", text) if n.strip()))
+
+@bot.tree.command(name="minutelog_targets", description="PtLogs1min に記録するユーザーを順位ではなくユーザー名で指定します（100位以内）。")
+@app_commands.describe(
+    players="ユーザー名をカンマ区切りで指定（例: 名前A,名前B）。省略すると1〜5位の記録に戻します。",
+    spreadsheet_id="対象のスプレッドシートID（省略すると全て）",
+)
+async def minutelog_targets(interaction: discord.Interaction, players: str = None, spreadsheet_id: str = None):
+    guild_id = interaction.guild_id or 0
+    targets = _target_spreadsheets(guild_id, spreadsheet_id)
+    if not targets:
+        await interaction.response.send_message("設定がありません。先に `/setup` してください。", ephemeral=True)
+        return
+    names = _parse_player_names(players)
+    await interaction.response.defer(thinking=True)
+    for ss_id in targets:
+        storage.set_minute_log_players(guild_id, ss_id, names)
+
+    results = []
+    for i, (ss_id, cfg) in enumerate(targets.items()):
+        try:
+            # 設定をすぐ反映するため、1件目は最新を取得し直す(2件目以降は同じ取得結果を使う)
+            msg = await minute_logger.run_once(guild_id, ss_id, cfg, force_fetch=(i == 0))
+        except Exception as e:
+            msg = f"更新失敗: {type(e).__name__}: {e}"
+        results.append(f"`{ss_id}`: {msg}")
+
+    if names:
+        ranks = {e["name"]: e["rank"] for e in reversed(minute_logger.cached_leaderboard())}
+        lines = [f"- {n}: {ranks[n]}位" if n in ranks else f"- {n}: ⚠️ 100位以内に見つかりません" for n in names]
+        head = "📈 PtLogs1min の記録対象をユーザー名指定にしました。\n" + "\n".join(lines)
+    else:
+        head = "📈 PtLogs1min の記録対象を 1〜5位 に戻しました。"
+    await interaction.followup.send(head + "\n" + "\n".join(results))
 
 if __name__ == "__main__":
     bot.run(TOKEN, log_handler=None)

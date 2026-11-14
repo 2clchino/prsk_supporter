@@ -91,5 +91,6 @@ docker compose logs -f
 | `Focus` | 差分表示するランク順位 |
 | `Runners` | ランナーのリスト（シフトシートの列数計算に使用） |
 | `LogInterval` | ランキング取得間隔（分、デフォルト 60） |
+| `MinuteLog` | `FALSE` で 1〜5 位の 1 分毎ポイント推移の記録を無効化（デフォルト有効）。5 分毎に jp.seka.ing から取得し、`PtLogs1min` シートを「取得時点の 1〜5 位の人それぞれの全履歴」で上書きする |
 | `ChangeNotice` | シフト通知を送る分（例: `55`） |
 | `NextServer` | 次サーバー情報を送る分 |

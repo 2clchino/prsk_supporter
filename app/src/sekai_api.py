@@ -1,3 +1,4 @@
+import re
 import requests
 import time
 from datetime import datetime, timedelta, timezone
@@ -384,3 +385,68 @@ def pick_hourly(times: List[str]) -> List[str]:
         target += timedelta(hours=1)
 
     return sorted(set(result), key=lambda x: x)
+
+_SEKA_ING_URL = "https://jp.seka.ing/"
+
+def parse_timeline(data: dict) -> Dict[datetime, int]:
+    """/api/event-stats/<hash> の timeline を {分単位のJST時刻: ポイント} に変換する。
+    (ユーザー詳細の Heatmap → Download as CSV で出力されるCSVと同じ元データ)"""
+    result: Dict[datetime, int] = {}
+    for item in data.get("timeline") or []:
+        try:
+            ts = datetime.fromisoformat(str(item["timestamp"]).replace("Z", "+00:00")).astimezone(JST)
+            score = int(item["score"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        result[ts.replace(second=0, microsecond=0)] = score
+    return result
+
+# 並列に投げると 429 (Too many requests) になるため、1件ずつ間隔を空けて取得し、429 の場合は待って再試行する
+_FETCH_TIMELINES_JS = """async (hashes) => {
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const results = [];
+    for (const h of hashes) {
+        let data = null;
+        for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+                const r = await fetch('/api/event-stats/' + h);
+                if (r.ok) { data = await r.json(); break; }
+                if (r.status !== 429) break;
+            } catch (e) {}
+            await sleep(3000 * (attempt + 1));
+        }
+        results.push([h, data]);
+        await sleep(500);
+    }
+    return results;
+}"""
+
+def fetch_minute_points(ranks: List[int] = (1, 2, 3, 4, 5), names: List[str] = ()) -> Dict[str, Any]:
+    """jp.seka.ing からランキング(100位まで)と、指定順位・指定ユーザー名の1分毎のポイント推移を取得する。
+    推移はユーザー詳細の Heatmap → Download as CSV と同じ元データ(/api/event-stats/<hash>)で、
+    Cloudflare を通過したページ内から fetch する。ユーザー名はランキング100位以内から検索する
+    (同名がいる場合は上位の方)。
+    戻り値は {"leaderboard": [{"rank", "name", "hash", "score"}, ...],
+              "timelines": {hash: {JST時刻(分単位): ポイント}}}。取得に失敗したユーザーは timelines に含まれない。"""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_context().new_page()
+            with page.expect_response(lambda r: "/api/events/now/leaderboard" in r.url, timeout=30000) as resp_info:
+                page.goto(_SEKA_ING_URL, wait_until="domcontentloaded", timeout=30000)
+            leaderboard = [
+                {"rank": e.get("rank"), "name": e.get("name"), "hash": e.get("hash"), "score": e.get("score")}
+                for e in (resp_info.value.json().get("rankings") or []) if e.get("hash")
+            ]
+            rank_hashes = [e["hash"] for e in leaderboard if e["rank"] in ranks]
+            name_hashes = [next((e["hash"] for e in leaderboard if e["name"] == n), None) for n in names]
+            hashes = list(dict.fromkeys(rank_hashes + [h for h in name_hashes if h]))
+            fetched = page.evaluate(_FETCH_TIMELINES_JS, hashes)
+        finally:
+            browser.close()
+    timelines = {h: parse_timeline(d) for h, d in fetched if d}
+    for h, d in fetched:
+        if not d:
+            print(f"[fetch_minute_points] event-stats {h} の取得に失敗しました")
+    return {"leaderboard": leaderboard, "timelines": {h: t for h, t in timelines.items() if t}}
