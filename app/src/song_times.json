@@ -1,0 +1,69 @@
+{
+  "source": "https://docs.google.com/spreadsheets/d/1NiPICfN59BFWq6TH6G19JbKbldMrlAV1tvDpgGsbCK4 (周回プランナー: 1回の時間(秒)※曲間込み)",
+  "songs": [
+    {
+      "name": "独りんぼエンヴィー",
+      "seconds": 106.8
+    },
+    {
+      "name": "ビバハピ",
+      "seconds": 126.0
+    },
+    {
+      "name": "虚無さん",
+      "seconds": 126.2
+    },
+    {
+      "name": "テトリス",
+      "seconds": 126.3
+    },
+    {
+      "name": "ブレス・ユア・ブレス",
+      "seconds": 126.9
+    },
+    {
+      "name": "ヒバナ",
+      "seconds": 127.0
+    },
+    {
+      "name": "レム",
+      "seconds": 127.0
+    },
+    {
+      "name": "Polar Star",
+      "seconds": 128.4
+    },
+    {
+      "name": "群青讃歌",
+      "seconds": 131.0
+    },
+    {
+      "name": "サンドリヨン",
+      "seconds": 149.6
+    },
+    {
+      "name": "ONESELF",
+      "seconds": 160.9
+    },
+    {
+      "name": "0.0000034",
+      "seconds": 186.3
+    },
+    {
+      "name": "メモリア",
+      "seconds": 191.9
+    },
+    {
+      "name": "What's up? Pop!",
+      "seconds": 192.5
+    },
+    {
+      "name": "メルト",
+      "seconds": 214.1
+    },
+    {
+      "name": "初音天地開闢神話",
+      "seconds": 214.4
+    }
+  ]
+}

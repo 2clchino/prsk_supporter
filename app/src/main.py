@@ -1,9 +1,10 @@
 import os
 import re
+import json
 import logging
 import math
 import asyncio, random
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Iterable, Tuple
 import discord
@@ -162,7 +163,40 @@ def _is_player(t) -> bool:
 
 _STALE_THRESHOLD_MINUTES = 30
 
-async def _fetch_all_scores(cfg: dict) -> tuple[dict, dict, str, bool, dict]:
+def _score_targets(cfg: dict) -> list:
+    trackings = cfg.get("Trackings") or []
+    focus_raw = cfg.get("Focus") or []
+    focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
+    return trackings + [f for f in focus_targets if f not in trackings]
+
+async def _fetch_all_scores(cfg: dict, *, prefer_realtime: bool = False) -> tuple[dict, dict, str, bool, dict]:
+    """prefer_realtime の場合は、毎分更新される jp.seka.ing(100位まで)を先に見る。
+    そこに見つからないプレイヤーだけ通常の取得結果(api.sekai.best)で補う。"""
+    if prefer_realtime:
+        chara_id = cfg.get("CharaID") if cfg.get("isWorldBloom") else None
+        try:
+            raw = await asyncio.to_thread(sekai_api._get_leaderboard_sekai_ing, chara_id)
+        except Exception as e:
+            print(f"[INFO] seka.ing の取得に失敗したため通常の取得に切り替えます ({type(e).__name__}: {e})")
+            raw = None
+        if raw:
+            all_targets = _score_targets(cfg)
+            scores = sekai_api.extract_scores(raw, all_targets)
+            ranks = sekai_api.extract_ranks(raw, all_targets)
+            resolved_names = sekai_api.resolve_display_names(raw, all_targets)
+            last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
+            missing = [t for t in all_targets if _is_player(t) and scores.get(t) is None]
+            if not missing:
+                return scores, ranks, last_time, True, resolved_names
+            print(f"[INFO] seka.ing に見つからないプレイヤーを api.sekai.best で補います: {missing}")
+            base_scores, base_ranks, _, _, base_names = await _fetch_all_scores(cfg)
+            for t in missing:
+                scores[t] = base_scores.get(t)
+                ranks[t] = base_ranks.get(t)
+                if t in base_names:
+                    resolved_names[t] = base_names[t]
+            return scores, ranks, last_time, True, resolved_names
+
     if cfg.get("isWorldBloom"):
         times = sekai_api.get_chapter_time(cfg["EventID"], cfg["CharaID"])
     else:
@@ -193,10 +227,7 @@ async def _fetch_all_scores(cfg: dict) -> tuple[dict, dict, str, bool, dict]:
         last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
         used_fallback = True
 
-    trackings = cfg.get("Trackings") or []
-    focus_raw = cfg.get("Focus") or []
-    focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
-    all_targets = trackings + [f for f in focus_targets if f not in trackings]
+    all_targets = _score_targets(cfg)
     scores = sekai_api.extract_scores(raw, all_targets)
     ranks = sekai_api.extract_ranks(raw, all_targets)
     resolved_names = sekai_api.resolve_display_names(raw, all_targets)
@@ -766,7 +797,6 @@ async def ranking_logger(ctx: dict) -> None:
                 await _safe_send(channel, full_msg)
     return None
 
-@registry.every_hour_at_config("AutoMinutes")
 async def auto_ranking_check(ctx: dict) -> str:
     cfg = ctx["config"]
     guild_id = ctx["guild_id"]
@@ -783,7 +813,8 @@ async def auto_ranking_check(ctx: dict) -> str:
         return None
 
     async def _run_once():
-        scores, _, _, _, _ = await _fetch_all_scores(cfg)
+        # Auto 監視は停滞をすぐ検知したいので、よりリアルタイムな jp.seka.ing を優先する
+        scores, _, _, _, _ = await _fetch_all_scores(cfg, prefer_realtime=True)
         return scores
 
     log_prefix = f"[AutoCheck] guild={guild_id} {now_jst().strftime('%H:%M')}"
@@ -853,7 +884,53 @@ async def auto_ranking_check(ctx: dict) -> str:
             _start_alarm(guild, alarm_channel_id, sound_path, key)
     return None
 
-scheduler = EventScheduler(bot, registry, aux_loops=[minute_logger.run_loop])
+DEFAULT_AUTO_CHECK_SECONDS = 300
+
+
+def _auto_check_seconds(cfg: dict) -> int:
+    try:
+        sec = int(cfg.get("AutoCheckSeconds") or DEFAULT_AUTO_CHECK_SECONDS)
+    except (TypeError, ValueError):
+        sec = DEFAULT_AUTO_CHECK_SECONDS
+    return max(60, sec)
+
+
+async def auto_check_loop(bot_: discord.Client, guild_id: int, spreadsheet_id: str, cfg: dict) -> None:
+    """Auto 監視を AutoCheckSeconds 秒(既定5分)毎に実行する。/set_alarm で選んだ楽曲の
+    1回の時間に合わせた秒単位の間隔にするため、毎時の分指定のスケジューラとは別に回す。"""
+    channel_id = cfg.get("ChannelID")
+    if not channel_id:
+        return
+    try:
+        channel = bot_.get_channel(int(channel_id)) or await bot_.fetch_channel(int(channel_id))
+    except Exception as e:
+        print(f"[AutoCheck] guild={guild_id}: チャンネル取得失敗: {type(e).__name__}: {e}")
+        return
+    start = ensure_aware_jst(cfg["EventStart"])
+    end = ensure_aware_jst(cfg["EventEnd"])
+    interval = _auto_check_seconds(cfg)
+    while True:
+        try:
+            now = now_jst()
+            if now >= end:
+                break
+            base = max(now, start)
+            # 実行時刻を interval の倍数に揃える(既定の5分なら毎時 00,05,...分)。ECS で二重実行を防ぐ判定にも使う
+            target_ts = (int(base.timestamp()) // interval + 1) * interval
+            await asyncio.sleep(max(0.0, target_ts - now_jst().timestamp()))
+            target = datetime.fromtimestamp(target_ts, tz=JST)
+            if not storage.mark_tick_if_new(guild_id, f"{spreadsheet_id}#autocheck", target.isoformat()):
+                continue
+            ctx = {"guild_id": guild_id, "spreadsheet_id": spreadsheet_id, "config": cfg, "now": target, "channel": channel}
+            await auto_ranking_check(ctx)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[AutoCheck] guild={guild_id}: {type(e).__name__}: {e}")
+            await asyncio.sleep(30)
+
+
+scheduler = EventScheduler(bot, registry, aux_loops=[minute_logger.run_loop, auto_check_loop])
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -928,7 +1005,8 @@ async def help_command(interaction: discord.Interaction):
         "__**定期実行（設定後に自動で動作）**__\n"
         "`ランキングログ` — LogInterval 分ごとにランキングを取得し、スプレッドシートに記録・チャンネルに投稿します。\n"
         "`シフト通知` — ChangeNotice で指定した時刻に直近のシフトをチャンネルに投稿します。(現在機能していません)\n"
-        "`Autoチェック` — Shift シートで Auto と記入された時間帯に5分ごとポイント増加を監視し、\n"
+        "`Autoチェック` — Shift シートで Auto と記入された時間帯に5分ごと（`/set_alarm` で楽曲を選ぶとその曲の1回の時間の1.5倍ごと）、\n"
+        "　jp.seka.ing を優先してポイント増加を監視し、\n"
         "　停滞していたら DiscordIDs のユーザーにメンションで通知します。\n"
     )
     await interaction.response.send_message(msg, ephemeral=False)
@@ -1020,10 +1098,14 @@ async def _execute_setup(interaction: discord.Interaction, config: dict, spreads
         log_interval = 60
     config["LogInterval"] = log_interval
     config["LogMinutes"] = sorted(set((m + 1) % 60 for m in range(0, 60, log_interval)))
-    config["AutoMinutes"] = list(range(0, 60, 5))
 
     guild_id = interaction.guild_id or 0
-    is_update = storage.load_guild_config(guild_id, spreadsheet_id) is not None
+    prev_config = storage.load_guild_config(guild_id, spreadsheet_id)
+    is_update = prev_config is not None
+    # /set_alarm で設定した内容は Config シートに無いため、/setup し直しても引き継ぐ
+    for k in _ALARM_CONFIG_KEYS:
+        if prev_config and prev_config.get(k) is not None:
+            config[k] = prev_config[k]
     storage.save_guild_config(guild_id, config)
     await scheduler.start_or_restart(guild_id, spreadsheet_id, config, on_event_start=_on_event_start)
     runners = config.get("Runners")
@@ -1237,6 +1319,8 @@ async def _build_status_block(config: dict, status_str: str, *, ss_label: str = 
         f"- 終了: {config.get('EventEnd')}\n"
         f"- ログ記録: {log_interval}分間隔（毎時 {log_minutes_str} 分）\n"
         f"- Auto監視（本日）: {auto_str}\n"
+        f"- Auto監視の間隔: {_fmt_seconds(_auto_check_seconds(config))}"
+        f"{'（' + config['AlarmSong'] + '）' if config.get('AlarmSong') else ''}\n"
         f"- 投稿チャンネル: <#{config.get('ChannelID')}>"
     )
 
@@ -1605,16 +1689,57 @@ async def _check_missing_auto(all_configs: dict) -> list:
             missing.append(cfg.get("EventName") or ss_id)
     return missing
 
+# /set_alarm で設定し、/setup し直しても引き継ぐ項目
+_ALARM_CONFIG_KEYS = ("AlarmChannelID", "AlarmSoundPath", "AlarmSong", "AutoCheckSeconds")
+
+# 周回する楽曲ごとの1回の時間(秒・曲間込み)。Auto 監視の間隔をこの1.5倍にする
+_AUTO_CHECK_SONG_FACTOR = 1.5
+with open(os.path.join(os.path.dirname(__file__), "song_times.json"), encoding="utf-8") as _f:
+    _SONG_SECONDS: dict[str, float] = {s["name"]: s["seconds"] for s in json.load(_f)["songs"]}
+_NO_SONG = "__none__"
+
+
+def _fmt_seconds(sec: int) -> str:
+    m, s = divmod(int(sec), 60)
+    return f"{m}分{s:02d}秒" if s else f"{m}分"
+
+
+def _song_select_options() -> list[discord.SelectOption]:
+    options = [discord.SelectOption(
+        label="選択しない",
+        value=_NO_SONG,
+        description=f"監視間隔: {_fmt_seconds(DEFAULT_AUTO_CHECK_SECONDS)}（デフォルト）",
+        default=True,
+    )]
+    for name, sec in _SONG_SECONDS.items():
+        options.append(discord.SelectOption(
+            label=name[:100],
+            value=name[:100],
+            description=f"1回 {sec:g}秒 → 監視間隔: {_fmt_seconds(round(sec * _AUTO_CHECK_SONG_FACTOR))}",
+        ))
+    return options[:25]
+
+
 class AlarmSetView(discord.ui.View):
     def __init__(self, vc_channel: discord.VoiceChannel, file: discord.Attachment | None, guild_id: int,
                  missing_auto: list = None):
-        super().__init__(timeout=60)
+        super().__init__(timeout=120)
         self.vc_channel = vc_channel
         self.file = file
         self.guild_id = guild_id
         self.missing_auto = missing_auto or []
+        self.song: str | None = None
 
-    @discord.ui.button(label="このVCで設定する", style=discord.ButtonStyle.primary)
+    @discord.ui.select(placeholder="周回する楽曲（Auto 監視の間隔を合わせます）", options=_song_select_options(), row=0)
+    async def select_song(self, interaction: discord.Interaction, select: discord.ui.Select):
+        value = select.values[0]
+        self.song = None if value == _NO_SONG else value
+        # 選択状態を表示に残す
+        for opt in select.options:
+            opt.default = opt.value == value
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="このVCで設定する", style=discord.ButtonStyle.primary, row=1)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -1641,23 +1766,30 @@ class AlarmSetView(discord.ui.View):
                 "⚠️ 有効な設定がありません。先に `/setup` でセットアップを行ってください。", ephemeral=True
             )
             return
+        check_seconds = (
+            round(_SONG_SECONDS[self.song] * _AUTO_CHECK_SONG_FACTOR) if self.song else DEFAULT_AUTO_CHECK_SECONDS
+        )
         for ss_id, cfg in all_configs.items():
             cfg["AlarmChannelID"] = self.vc_channel.id
             cfg["AlarmSoundPath"] = sound_path  # None = デフォルト音
+            cfg["AlarmSong"] = self.song
+            cfg["AutoCheckSeconds"] = check_seconds
             storage.save_guild_config(self.guild_id, cfg)
             await scheduler.start_or_restart(self.guild_id, ss_id, cfg, on_event_start=_on_event_start)
 
         sound_label = self.file.filename if self.file else "デフォルト音"
+        song_label = f"{self.song}（1回 {_SONG_SECONDS[self.song]:g}秒 × {_AUTO_CHECK_SONG_FACTOR}）" if self.song else "選択なし"
         warning = (
             f"\n⚠️ Shift シート上で、現在〜次の1時間にAutoと記入されたランナーが見つかりません"
             f"（{', '.join(self.missing_auto)}）。この状態のままだとアラームは鳴りません。Shift シートの記入をご確認ください。"
         ) if self.missing_auto else ""
         await interaction.followup.send(
-            f"🔔 アラームを設定しました。\n- VC: **{self.vc_channel.name}**\n- 音声: {sound_label}{warning}",
+            f"🔔 アラームを設定しました。\n- VC: **{self.vc_channel.name}**\n- 音声: {sound_label}\n"
+            f"- 楽曲: {song_label}\n- Auto 監視の間隔: {_fmt_seconds(check_seconds)}{warning}",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary, row=1)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="キャンセルしました。", view=None)
 
@@ -1688,7 +1820,9 @@ async def set_alarm(interaction: discord.Interaction, file: discord.Attachment =
     ) if missing_auto else ""
 
     await interaction.response.send_message(
-        f"🔔 **{vc_channel.name}** でアラームを設定します{sound_label}。よろしいですか？{warning}",
+        f"🔔 **{vc_channel.name}** でアラームを設定します{sound_label}。よろしいですか？\n"
+        f"周回する楽曲を選ぶと、Auto 監視の間隔をその曲の1回の時間の{_AUTO_CHECK_SONG_FACTOR}倍にします"
+        f"（選ばなければ{_fmt_seconds(DEFAULT_AUTO_CHECK_SECONDS)}間隔）。{warning}",
         view=AlarmSetView(vc_channel, file, guild_id, missing_auto=missing_auto),
         ephemeral=True,
     )
