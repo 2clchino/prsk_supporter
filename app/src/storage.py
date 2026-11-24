@@ -118,7 +118,14 @@ def load_all_configs() -> Dict[Tuple[int, str], Dict[str, Any]]:
             result[(guild_id, ss_id)] = cfg
     return result
 
-def _pending_refle_key(guild_id: int, spreadsheet_id: str, tracking_key) -> str:
+# リフレ値の手動補正と1分毎ログの記録対象は、同じスプレッドシートを複数のサーバーで /setup している場合に
+# どのサーバーから入力しても同じシートに反映されるよう、スプレッドシート単位で保存する。
+# (以前はサーバー単位 "{guild_id}:{spreadsheet_id}" で保存していたため、読み込み時はそちらも見る)
+
+def _pending_refle_key(spreadsheet_id: str, tracking_key) -> str:
+    return f"{spreadsheet_id}:{tracking_key}"
+
+def _legacy_pending_refle_key(guild_id: int, spreadsheet_id: str, tracking_key) -> str:
     return f"{guild_id}:{spreadsheet_id}:{tracking_key}"
 
 def save_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key, value: float, time_iso: str) -> None:
@@ -126,36 +133,42 @@ def save_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key, value: 
     with _locked():
         data = _read_all()
         pending = data.setdefault("_pending_refle", {})
-        pending[_pending_refle_key(guild_id, spreadsheet_id, tracking_key)] = {"value": value, "time": time_iso}
+        pending.pop(_legacy_pending_refle_key(guild_id, spreadsheet_id, tracking_key), None)
+        pending[_pending_refle_key(spreadsheet_id, tracking_key)] = {"value": value, "time": time_iso}
         _write_all(data)
 
 def get_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key) -> Optional[Dict[str, Any]]:
-    data = _read_all()
-    return data.get("_pending_refle", {}).get(_pending_refle_key(guild_id, spreadsheet_id, tracking_key))
+    pending = _read_all().get("_pending_refle", {})
+    return (pending.get(_pending_refle_key(spreadsheet_id, tracking_key))
+            or pending.get(_legacy_pending_refle_key(guild_id, spreadsheet_id, tracking_key)))
 
 def clear_pending_refle(guild_id: int, spreadsheet_id: str, tracking_key) -> None:
     with _locked():
         data = _read_all()
         pending = data.get("_pending_refle", {})
-        key = _pending_refle_key(guild_id, spreadsheet_id, tracking_key)
-        if key in pending:
-            pending.pop(key)
+        keys = [_pending_refle_key(spreadsheet_id, tracking_key),
+                _legacy_pending_refle_key(guild_id, spreadsheet_id, tracking_key)]
+        if any(k in pending for k in keys):
+            for k in keys:
+                pending.pop(k, None)
             _write_all(data)
 
 def get_minute_log_players(guild_id: int, spreadsheet_id: str) -> list:
     """1分毎ログで、順位の代わりに追跡するユーザー名のリストを返す(未設定なら空リスト=1〜5位を記録)。"""
-    data = _read_all()
-    return data.get("_minute_log_players", {}).get(f"{guild_id}:{spreadsheet_id}", [])
+    players = _read_all().get("_minute_log_players", {})
+    return players.get(spreadsheet_id) or players.get(f"{guild_id}:{spreadsheet_id}", [])
 
 def set_minute_log_players(guild_id: int, spreadsheet_id: str, players: list) -> None:
     with _locked():
         data = _read_all()
         all_players = data.setdefault("_minute_log_players", {})
-        key = f"{guild_id}:{spreadsheet_id}"
+        # 他のサーバーの旧形式の設定が残っていると、解除しても読み込み時にそちらが使われてしまうため全て消す
+        for k in [k for k in all_players if k.endswith(f":{spreadsheet_id}")]:
+            all_players.pop(k)
         if players:
-            all_players[key] = players
+            all_players[spreadsheet_id] = players
         else:
-            all_players.pop(key, None)
+            all_players.pop(spreadsheet_id, None)
         _write_all(data)
 
 def delete_guild_config(guild_id: int, spreadsheet_id: str = None) -> None:

@@ -208,8 +208,9 @@ async def run_loop(bot: discord.Client, guild_id: int, spreadsheet_id: str, cfg:
             target = _next_tick(max(now, start))
             await asyncio.sleep(max(0.0, (target - now_jst()).total_seconds()))
 
-            # ECS のローリングデプロイ中に新旧タスクが二重に書き込まないようにする
-            if not storage.mark_tick_if_new(guild_id, f"{spreadsheet_id}#minutelog", target.isoformat()):
+            # 同じスプレッドシートを複数のサーバーで /setup している場合や、ECS のローリングデプロイ中に
+            # 新旧タスクが動いている場合に、同じシートへ二重に書き込まないよう、スプレッドシート単位で1回だけ実行する
+            if not storage.mark_tick_if_new(0, f"{spreadsheet_id}#minutelog", target.isoformat()):
                 continue
             await run_once(guild_id, spreadsheet_id, cfg)
         except asyncio.CancelledError:

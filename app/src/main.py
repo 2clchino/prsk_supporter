@@ -163,10 +163,19 @@ def _is_player(t) -> bool:
 
 _STALE_THRESHOLD_MINUTES = 30
 
+def _focus_targets(cfg: dict) -> list:
+    """Config の Focus を対象のリストにする。順位(数値)・ユーザー名・twitterId:xxx のいずれも可。
+    単一値の場合はリストではなくそのまま入っているため包む(文字列を list() すると1文字ずつに分解されてしまう)。"""
+    raw = cfg.get("Focus")
+    if raw in (None, ""):
+        return []
+    if isinstance(raw, list):
+        return [f for f in raw if f not in (None, "")]
+    return [raw]
+
 def _score_targets(cfg: dict) -> list:
     trackings = cfg.get("Trackings") or []
-    focus_raw = cfg.get("Focus") or []
-    focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
+    focus_targets = _focus_targets(cfg)
     return trackings + [f for f in focus_targets if f not in trackings]
 
 async def _fetch_all_scores(cfg: dict, *, prefer_realtime: bool = False) -> tuple[dict, dict, str, bool, dict]:
@@ -383,8 +392,7 @@ def _format_ranking_lines(
     refle_info: dict = None,
 ) -> str:
     trackings = cfg.get("Trackings") or []
-    focus_raw = cfg.get("Focus") or []
-    focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
+    focus_targets = _focus_targets(cfg)
     t2r = _tracking_to_runner(cfg)
 
     rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
@@ -454,15 +462,29 @@ def _format_ranking_lines(
         rank_prefix = f"[{rank}位] " if rank is not None else ""
         lines.append(f"{rank_prefix}{_display(k)}: {v:,}{change_info(k, v)}")
 
-    if focus_scores:
+    def _focus_label(fk) -> str:
+        # 順位指定は「N位」、ユーザー名指定は現在順位を添えて表示する
+        if isinstance(fk, int) and not _is_player(fk):
+            return f"{fk}位"
+        rank = all_ranks.get(fk) if all_ranks else None
+        return f"[{rank}位] {_display(fk)}" if rank is not None else _display(fk)
+
+    focus_lines = []
+    for fk in focus_targets:
+        fv = focus_scores.get(fk)
+        if fv is None:
+            focus_lines.append(f"{_focus_label(fk)}: 取得できませんでした")
+            continue
+        focus_line = f"{_focus_label(fk)}: {fv:,}{change_info(fk, fv)}"
+        for k, v in sorted_players:
+            if k == fk:
+                continue
+            focus_line += f"\n   | {_display(k)} {_fmt(v - fv)}"
+        focus_lines.append(focus_line)
+    if focus_lines:
         if lines:
             lines.append("")
-        for fk, fv in focus_scores.items():
-            focus_line = f"{fk}: {fv:,}{change_info(fk, fv)}"
-            for k, v in sorted_players:
-                diff = v - fv
-                focus_line += f"\n   | {_display(k)} {_fmt(diff)}"
-            lines.append(focus_line)
+        lines.extend(focus_lines)
 
     if update_prev:
         existing_scores = _logger_prev_scores.get(key, {})
@@ -682,6 +704,29 @@ async def _resolve_prev_state(
             prev_deltas[k] = values[-1] - values[0]
     return prev, prev_deltas
 
+# 同じスプレッドシートを複数のサーバーで /setup している場合、同じ時刻の取得・シートへの書き込みは
+# 最初に実行したサーバーだけが行い、他のサーバーはその結果を使って Discord への投稿だけを行う
+_SHARED_RESULT_TTL = 600
+_shared_results: dict[tuple, tuple[float, object]] = {}
+_shared_locks: dict[tuple, asyncio.Lock] = {}
+
+
+async def _run_shared(key: tuple, factory) -> tuple[object, bool]:
+    """key ごとに factory() を1回だけ実行し、その結果を返す。戻り値は (結果, このサーバーで実行したか)。
+    失敗した場合は結果を共有しないので、待っていた他のサーバーが改めて実行する。"""
+    loop = asyncio.get_running_loop()
+    for k in [k for k, (t, _) in _shared_results.items() if loop.time() - t > _SHARED_RESULT_TTL]:
+        _shared_results.pop(k, None)
+        _shared_locks.pop(k, None)
+    async with _shared_locks.setdefault(key, asyncio.Lock()):
+        hit = _shared_results.get(key)
+        if hit is not None:
+            return hit[1], False
+        result = await factory()
+        _shared_results[key] = (loop.time(), result)
+        return result, True
+
+
 @registry.every_hour_at_config("LogMinutes")
 async def ranking_logger(ctx: dict) -> None:
     cfg = ctx["config"]
@@ -691,10 +736,10 @@ async def ranking_logger(ctx: dict) -> None:
     target = ctx.get("now", now_jst())
     view_timeout = cfg.get("LogInterval", 60) * 60
 
-    async def _run_once():
-        all_scores, all_ranks, last_time, used_fallback, resolved_names = await _fetch_all_scores(cfg)
+    trackings = cfg.get("Trackings") or []
 
-        trackings = cfg.get("Trackings") or []
+    async def _fetch_and_write() -> dict:
+        all_scores, all_ranks, last_time, used_fallback, resolved_names = await _fetch_all_scores(cfg)
         rankings = {k: v for k, v in all_scores.items() if k in trackings and v is not None}
 
         # 今回のスコアを PtLogs に書き込む前に、前回値・前々回値を解決する。
@@ -707,9 +752,24 @@ async def ranking_logger(ctx: dict) -> None:
 
         await asyncio.to_thread(ptlogger.write_values, cfg["SpreadsheetID"], last_time, rankings)
 
+        # リフレ値はシート上の直前の累積値に加算して書き込むため、複数のサーバーで実行すると二重に加算される。
+        # _run_shared で同じシート・同じ時刻については1回だけ実行する
         refle_info = await _compute_refle_info(
             cfg, guild_id, cfg["SpreadsheetID"], last_time, target, trackings, all_scores, prev_scores,
         )
+        return {
+            "all_scores": all_scores, "all_ranks": all_ranks, "last_time": last_time,
+            "used_fallback": used_fallback, "resolved_names": resolved_names, "rankings": rankings,
+            "prev_scores": prev_scores, "prev_deltas": prev_deltas, "refle_info": refle_info,
+        }
+
+    async def _run_once():
+        shared, computed_here = await _run_shared((spreadsheet_id, "ranking_logger", target.isoformat()), _fetch_and_write)
+        if not computed_here:
+            print(f"[ranking_logger] guild={guild_id}: 同じスプレッドシートを使う他サーバーの取得・書き込み結果を使います")
+        all_scores, all_ranks, last_time = shared["all_scores"], shared["all_ranks"], shared["last_time"]
+        used_fallback, resolved_names, rankings = shared["used_fallback"], shared["resolved_names"], shared["rankings"]
+        prev_scores, prev_deltas, refle_info = shared["prev_scores"], shared["prev_deltas"], shared["refle_info"]
 
         missing = [t for t in trackings if t not in rankings]
         has_missing = bool(missing)
@@ -749,8 +809,7 @@ async def ranking_logger(ctx: dict) -> None:
         if not channel:
             return None
         trackings = cfg.get("Trackings") or []
-        focus_raw = cfg.get("Focus") or []
-        focus_targets = [focus_raw] if isinstance(focus_raw, int) else list(focus_raw)
+        focus_targets = _focus_targets(cfg)
         player_trackings = [t for t in trackings if _is_player(t)]
         all_missing = player_trackings + [f for f in focus_targets if f not in player_trackings]
         last_time = now_jst().strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -812,10 +871,18 @@ async def auto_ranking_check(ctx: dict) -> str:
             await _safe_send(channel, "⏹ Auto の時間帯が終わったため、アラームを止めました。")
         return None
 
-    async def _run_once():
+    async def _fetch():
         # Auto 監視は停滞をすぐ検知したいので、よりリアルタイムな jp.seka.ing を優先する
         scores, _, _, _, _ = await _fetch_all_scores(cfg, prefer_realtime=True)
         return scores
+
+    async def _run_once():
+        # 同じスプレッドシートを使う他サーバーの同じ時刻の監視とは、取得結果を共有する
+        tick = ctx.get("now")
+        if tick is None:
+            return await _fetch()
+        scores, _ = await _run_shared((spreadsheet_id, "autocheck", tick.isoformat()), _fetch)
+        return dict(scores)
 
     log_prefix = f"[AutoCheck] guild={guild_id} {now_jst().strftime('%H:%M')}"
 
@@ -985,7 +1052,7 @@ async def help_command(interaction: discord.Interaction):
         "`EventName` — イベント名（部分一致）\n"
         "`ChapterNo` — WL チャプター番号（通常イベントは0または省略）\n"
         "`Trackings` — 記録するユーザー名または順位のリスト\n"
-        "`Focus` — 差分を表示する順位\n"
+        "`Focus` — 差分を表示する対象。順位またはユーザー名（Trackings と同じ書式、カンマ区切りで複数可）\n"
         "`Runners` — ランナーのリスト（Trackingsと同じ順番）\n"
         "`DiscordIDs` — ランナーのDiscord ID（Trackingsと同じ順番。Autoチェックの停滞通知でメンションします）\n"
         "`LogInterval` — ログ記録間隔（分）\n"
@@ -1241,7 +1308,7 @@ class StatusEditView(discord.ui.View):
 
         for label, key, field_label, cur_val, style, mlen in [
             ("追跡対象", "Trackings", "追跡対象（カンマ区切り）", trk_str, discord.TextStyle.paragraph, 500),
-            ("フォーカス順位", "Focus", "差分表示対象（単一値 or カンマ区切り）", focus_str, discord.TextStyle.short, 200),
+            ("フォーカス", "Focus", "差分表示対象（順位 or ユーザー名、カンマ区切り）", focus_str, discord.TextStyle.short, 200),
             ("1エビPt", "1Ebi", "1回のポイント（単一値 or カンマ区切り）", one_ebi_str, discord.TextStyle.short, 200),
             ("ログ間隔", "LogInterval", "ログ間隔（分・1〜60）", str(config.get("LogInterval", 60)), discord.TextStyle.short, 5),
         ]:
